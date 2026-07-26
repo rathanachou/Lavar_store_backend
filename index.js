@@ -19,23 +19,32 @@ const { authenticate, authorizeRoles } = require("./src/middlewares/authMiddlewa
 const app  = express();
 const port = process.env.PORT || 3000;
 
-const allowedOrigins = [
+// Read allowed origins from environment (comma-separated) + always-add dev origins
+const envOrigins = (process.env.FRONTEND_URL || "")
+  .split(",")
+  .map((s) => s.trim())
+  .filter(Boolean);
+const devOrigins = [
   "http://localhost:3000",
   "http://localhost:5173",
   "http://localhost:5174",
   "http://localhost:5175",
-  "https://www.abc.com",
 ];
+const allowedOrigins = [...new Set([...devOrigins, ...envOrigins])];
+
+console.log("CORS allowed origins:", allowedOrigins);
 
 app.use(cors({
   origin: (origin, callback) => {
-    if (!origin || origin.startsWith("http://localhost")) {
-      callback(null, true);
-    } else if (allowedOrigins.includes(origin)) {
-      callback(null, true);
-    } else {
-      callback(new Error("Not allowed by CORS"));
-    }
+    // Allow requests with no origin (server-to-server, curl, etc.)
+    if (!origin) return callback(null, true);
+    // Allow any localhost origin (dev)
+    if (origin.startsWith("http://localhost")) return callback(null, true);
+    // Check against the explicit allow list
+    if (allowedOrigins.includes(origin)) return callback(null, true);
+    // Log rejected origins for debugging
+    console.warn(`CORS blocked origin: ${origin}`);
+    callback(new Error("Not allowed by CORS"));
   },
   methods: "GET,POST,PUT,DELETE,PATCH",
   credentials: true,
