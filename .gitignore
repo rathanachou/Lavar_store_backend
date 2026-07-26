@@ -1,0 +1,4 @@
+.env
+node_modules
+uploadsconfig/config.json
+config/config.json
