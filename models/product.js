@@ -17,6 +17,11 @@ module.exports = (sequelize, DataTypes) => {
         foreignKey: "productId",
         as: "orderDetails",
       });
+
+      Product.hasMany(models.ProductBatch, {
+        foreignKey: "productId",
+        as: "batches",
+      });
     }
   }
 
@@ -29,6 +34,17 @@ module.exports = (sequelize, DataTypes) => {
       isActive: DataTypes.BOOLEAN,
       barcode: DataTypes.STRING,
       sku: DataTypes.STRING,
+      expireDate: {
+        type: DataTypes.DATEONLY,
+        field: "expire_date",
+        allowNull: true,
+      },
+      discountPercent: {
+        type: DataTypes.DECIMAL(5, 2),
+        field: "discount_percent",
+        allowNull: false,
+        defaultValue: 0,
+      },
     },
     {
       sequelize,

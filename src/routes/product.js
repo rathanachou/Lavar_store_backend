@@ -1,9 +1,10 @@
 const express = require("express");
 const fs = require("fs");
 const path = require("path");
-const { Product, ProductImage, Category } = require("../../models");
+const { Product, ProductImage, ProductBatch, Category } = require("../../models");
 const { Op, fn, col, where } = require("sequelize");
 const generateBarcodePDF = require('../utils/generateBarcodePDF');
+const { addStockToBatch, deductStockFifo, syncProductFromBatches } = require('../utils/batchStock');
 const { authenticate, authorizeRoles } = require("../middlewares/authMiddleware");
 const router = express.Router();
 const { storage, cloudinary } = require('../storage/storage')
@@ -120,6 +121,64 @@ router.get("/stock/low", async (req, res) => {
   }
 });
 
+// ─── GET: Near Expiry Products ───────────────────────────
+// Returns individual ProductBatch rows whose expire_date is within `days`
+// from today (default 20), sorted by expire_date ascending, joined with the
+// product (name/sku/price/discount). Includes already-discounted products too.
+router.get("/near-expiry", async (req, res) => {
+  try {
+    const days = Math.max(1, Number(req.query.days) || 20);
+
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+
+    const horizon = new Date(today);
+    horizon.setDate(horizon.getDate() + days);
+    horizon.setHours(23, 59, 59, 999);
+
+    const batches = await ProductBatch.findAll({
+      where: {
+        qty: { [Op.gt]: 0 },
+        expireDate: { [Op.ne]: null },
+        [Op.and]: [
+          { expireDate: { [Op.gte]: today } },
+          { expireDate: { [Op.lte]: horizon } },
+        ],
+      },
+      order: [["expireDate", "ASC"], ["createdAt", "ASC"]],
+      include: [
+        {
+          model: Product,
+          as: "product",
+          attributes: [
+            "id", "name", "sku", "price", "qty",
+            "discountPercent",
+          ],
+          include: [
+            { model: Category, as: "category", attributes: ["id", "name"] },
+            {
+              model: ProductImage,
+              as: "productImages",
+              attributes: ["id", "productId", "imageUrl", "fileName", "publicId"],
+            },
+          ],
+        },
+      ],
+    });
+
+    res.json({
+      success: true,
+      message: "Near-expiry batches fetched successfully",
+      data: batches,
+      total: batches.length,
+      days,
+    });
+  } catch (error) {
+    console.error("Near-expiry error:", error);
+    res.status(500).json({ success: false, message: "Internal server error" });
+  }
+});
+
 // ─── GET: Lookup product by barcode — fast O(1) DB lookup ────
 router.get("/barcode/:code", async (req, res) => {
   try {
@@ -222,6 +281,108 @@ router.post('/barcodes/print', authenticate, authorizeRoles('admin'), async (req
   }
 });
 
+// ─── POST: Add Product Batch (admin/cashier) ─────────────
+// Body: { qty, expire_date?, batch_number?, cost_price? }
+// Adds received stock as a new batch instead of just bumping Product.qty.
+router.post("/:id/batches", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { qty, expire_date, batch_number, cost_price } = req.body;
+
+    const product = await Product.findByPk(id);
+    if (!product) {
+      return res.status(404).json({
+        success: false,
+        message: `Product id=${id} not found`,
+      });
+    }
+
+    if (!qty || isNaN(qty) || Number(qty) <= 0) {
+      return res.status(400).json({
+        success: false,
+        message: "qty must be a positive number",
+      });
+    }
+
+    const batch = await addStockToBatch(
+      id,
+      {
+        qty: Number(qty),
+        expireDate: expire_date || null,
+        batchNumber: batch_number || null,
+        costPrice: cost_price,
+      }
+    );
+
+    res.status(201).json({
+      success: true,
+      message: "Batch added successfully",
+      data: batch,
+    });
+  } catch (error) {
+    console.error("Add batch error:", error);
+    res.status(500).json({ success: false, message: "Internal server error" });
+  }
+});
+
+// ─── GET: List Product Batches ───────────────────────────
+// Ordered by expire_date ASC (soonest-expiring first), no-expiry last.
+router.get("/:id/batches", async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const product = await Product.findByPk(id);
+    if (!product) {
+      return res.status(404).json({
+        success: false,
+        message: `Product id=${id} not found`,
+      });
+    }
+
+    const batches = await ProductBatch.findAll({
+      where: { productId: id },
+      order: [["expireDate", "ASC NULLS LAST"], ["createdAt", "ASC"]],
+    });
+
+    res.json({
+      success: true,
+      message: "Product batches fetched successfully",
+      data: batches,
+      total: batches.length,
+    });
+  } catch (error) {
+    console.error("Get batches error:", error);
+    res.status(500).json({ success: false, message: "Internal server error" });
+  }
+});
+
+// ─── DELETE: Remove a Product Batch (admin only) ─────────
+router.delete("/batches/:batchId", authenticate, authorizeRoles("admin"), async (req, res) => {
+  try {
+    const { batchId } = req.params;
+
+    const batch = await ProductBatch.findByPk(batchId);
+    if (!batch) {
+      return res.status(404).json({
+        success: false,
+        message: `Batch id=${batchId} not found`,
+      });
+    }
+
+    const productId = batch.productId;
+    await batch.destroy();
+    await syncProductFromBatches(productId);
+
+    res.json({
+      success: true,
+      message: "Batch deleted successfully",
+    });
+  } catch (error) {
+    console.error("Delete batch error:", error);
+    res.status(500).json({ success: false, message: "Internal server error" });
+  }
+});
+
 // ─── GET: Stock Info ──────────────────────────────────────
 router.get("/:id/stock", async (req, res) => {
   try {
@@ -277,7 +438,7 @@ router.get('/:id/barcode/print', async (req, res) => {
 // ─── POST: Create Product (admin only) ───────────────────
 router.post("/", authenticate, authorizeRoles("admin"), async (req, res) => {
   try {
-    const { name, price, categoryId, isActive, qty, barcode, sku } = req.body;
+    const { name, price, categoryId, isActive, qty, barcode, sku, expireDate, expire_date } = req.body;
 
     if (!name || !price || !categoryId) {
       return res.status(400).json({
@@ -294,7 +455,20 @@ router.post("/", authenticate, authorizeRoles("admin"), async (req, res) => {
       isActive: isActive ?? true,
       barcode: barcode || null,
       sku: sku || null,
+      expireDate: expireDate ?? expire_date ?? null,
     });
+
+    // Keep the batch table as source of truth: seed an initial batch for any
+    // starting stock so Products.qty = SUM(ProductBatches.qty) always holds.
+    if (Number(qty) > 0) {
+      await addStockToBatch(
+        createdProduct.id,
+        {
+          qty: Number(qty),
+          expireDate: expireDate ?? expire_date ?? null,
+        }
+      );
+    }
 
     res.status(201).json({
       success: true,
@@ -434,7 +608,7 @@ router.delete("/:id", authenticate, authorizeRoles("admin"), async (req, res) =>
 router.put("/:id", authenticate, authorizeRoles("admin"), async (req, res) => {
   try {
     const { id } = req.params;
-    const { name, price, categoryId, isActive, qty, barcode, sku } = req.body;
+    const { name, price, categoryId, isActive, qty, barcode, sku, expireDate, expire_date } = req.body;
 
     const product = await Product.findByPk(id);
     if (!product) {
@@ -444,7 +618,69 @@ router.put("/:id", authenticate, authorizeRoles("admin"), async (req, res) => {
       });
     }
 
-    await product.update({ name, price, categoryId, qty, isActive, barcode: barcode || null, sku: sku || null });
+    // Normalize empty expire_date to null so clearing the field works
+    const nextExpireDate = expireDate ?? expire_date ?? null;
+    // True when the caller explicitly sent the expire-date field (even null),
+    // so we can tell "user cleared the date" from "field not included at all".
+    const expireFieldProvided =
+      Object.prototype.hasOwnProperty.call(req.body, "expireDate") ||
+      Object.prototype.hasOwnProperty.call(req.body, "expire_date");
+
+    await product.update({
+      name,
+      price,
+      categoryId,
+      qty,
+      isActive,
+      barcode: barcode || null,
+      sku: sku || null,
+      expireDate: nextExpireDate,
+    });
+
+    // Reconcile the denormalized Product.qty field against the batch table.
+    // Batches are the source of truth; if the form's qty differs from the sum
+    // of batch quantities, add or deduct the difference so the invariant holds.
+    const requestedQty = Number(qty) || 0;
+    const batches = await ProductBatch.findAll({ where: { productId: id } });
+    const sumQty = batches.reduce((s, b) => s + Number(b.qty), 0);
+    const delta = requestedQty - sumQty;
+
+    if (delta > 0) {
+      await addStockToBatch(id, { qty: delta, expireDate: nextExpireDate });
+      // A form-set expireDate must win over any older batch expiry, so stamp
+      // every qty>0 batch with it; otherwise the sync below prefers the
+      // soonest existing batch and the saved value would be clobbered.
+      if (expireFieldProvided && nextExpireDate) {
+        await ProductBatch.update(
+          { expireDate: nextExpireDate },
+          { where: { productId: id, qty: { [Op.gt]: 0 } } }
+        );
+      }
+      await syncProductFromBatches(id);
+    } else if (delta < 0) {
+      await deductStockFifo(id, Math.abs(delta));
+      // Same batch reconciliation as the other branches so a form-set or
+      // form-cleared expireDate survives even when stock was deducted.
+      if (expireFieldProvided) {
+        await ProductBatch.update(
+          { expireDate: nextExpireDate },
+          { where: { productId: id, qty: { [Op.gt]: 0 } } }
+        );
+        await syncProductFromBatches(id);
+      }
+    } else {
+      // qty already matches — reconcile the batch that drives the expire_date
+      // cache so the form value (set or cleared) survives the sync below
+      // instead of being clobbered by syncProductFromBatches.
+      if (expireFieldProvided) {
+        await ProductBatch.update(
+          { expireDate: nextExpireDate },
+          { where: { productId: id, qty: { [Op.gt]: 0 } } }
+        );
+      }
+      // Refresh expire_date cache from batches (sooner batch wins).
+      await syncProductFromBatches(id);
+    }
 
     const updatedProduct = await Product.findByPk(id, {
       include: [{ model: Category, as: "category" }],
@@ -483,8 +719,12 @@ router.patch("/:id/stock/in", authenticate, authorizeRoles("admin"), async (req,
     }
 
     const oldQty = product.qty;
-    const newQty = oldQty + Number(qty);
-    await product.update({ qty: newQty });
+
+    // Add as a new batch (no expiry) — batches are the source of truth.
+    await addStockToBatch(id, { qty: Number(qty) });
+
+    const updated = await Product.findByPk(id);
+    const newQty = updated.qty;
 
     res.json({
       success: true,
@@ -532,8 +772,12 @@ router.patch("/:id/stock/out", authenticate, authorizeRoles("admin"), async (req
     }
 
     const oldQty = product.qty;
-    const newQty = oldQty - Number(qty);
-    await product.update({ qty: newQty });
+
+    // Deduct FIFO (soonest-expiring batch first) — batches are the source of truth.
+    await deductStockFifo(id, Number(qty));
+
+    const updated = await Product.findByPk(id);
+    const newQty = updated.qty;
 
     res.json({
       success: true,
@@ -548,6 +792,61 @@ router.patch("/:id/stock/out", authenticate, authorizeRoles("admin"), async (req
     });
   } catch (error) {
     console.error("Stock out error:", error);
+    res.status(500).json({ success: false, message: "Internal server error" });
+  }
+});
+
+// ─── PATCH: Set Product Discount (admin only) ────────────
+// Body: { discount_percent: 0–100 }
+// Passing discount_percent = 0 (or omitting it) clears the discount.
+router.patch("/:id/discount", authenticate, authorizeRoles("admin"), async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { discount_percent } = req.body;
+
+    const product = await Product.findByPk(id);
+    if (!product) {
+      return res.status(404).json({
+        success: false,
+        message: `Product id=${id} not found`,
+      });
+    }
+
+    let percent = 0;
+    if (discount_percent !== undefined && discount_percent !== null && discount_percent !== "") {
+      percent = Number(discount_percent);
+      if (isNaN(percent) || percent < 0 || percent > 100) {
+        return res.status(400).json({
+          success: false,
+          message: "discount_percent must be a number between 0 and 100",
+        });
+      }
+      // Discounts outside 10–90% are rejected (0 still means "clear discount")
+      if (percent !== 0 && (percent < 10 || percent > 90)) {
+        return res.status(400).json({
+          success: false,
+          message: "Discount must be between 10% and 90%",
+        });
+      }
+    }
+
+    await product.update({
+      discountPercent: percent,
+    });
+
+    const updatedProduct = await Product.findByPk(id, {
+      include: [{ model: Category, as: "category" }],
+    });
+
+    res.json({
+      success: true,
+      message: percent > 0
+        ? `Discount set to ${percent}%`
+        : "Discount removed",
+      data: updatedProduct,
+    });
+  } catch (error) {
+    console.error("Set discount error:", error);
     res.status(500).json({ success: false, message: "Internal server error" });
   }
 });
