@@ -16,6 +16,15 @@ router.post("/register", async (req, res) => {
       return res.status(400).json({ message: "All fields are required" });
     }
 
+    // Normalize to lowercase so the case-sensitive role ENUM and gender column
+    // accept any input casing ("Admin"→"admin", "Male"→"male").
+    const normalizedRole   = String(role || "cashier").toLowerCase();
+    const normalizedGender = String(gender || "").toLowerCase();
+
+    if (!["admin", "cashier"].includes(normalizedRole)) {
+      return res.status(400).json({ message: "Role must be 'admin' or 'cashier'" });
+    }
+
     const existingUser = await User.findOne({ where: { email } });
     if (existingUser) {
       return res.status(400).json({ message: "Email already exists" });
@@ -30,8 +39,8 @@ router.post("/register", async (req, res) => {
     const user = await User.create({
       firstName, lastName, email,
       password: hashedPassword,
-      gender,
-      role: role || "cashier",
+      gender: normalizedGender,
+      role: normalizedRole,
       email_verified: false,
       verification_token: verificationToken,
       verification_token_expires: verificationTokenExpires,
