@@ -1,7 +1,7 @@
+require("dotenv").config();
 const express = require("express");
 const db      = require("./models");
 const cors    = require("cors");
-require("dotenv").config();
 
 const authRoute      = require("./src/routes/auth");
 const customerRoute  = require("./src/routes/customer");
@@ -75,6 +75,39 @@ app.use("/api/v1/payments",   authenticate, paymentRoute);
 app.use("/api/v1/users",     authenticate, authorizeRoles("admin"), userRoute);
 app.use("/api/v1/dashboard", authenticate, authorizeRoles("admin"), dashboardRoute);
 app.use("/api/v1/reports",   authenticate, authorizeRoles("admin"), reportRoute);
+
+// ─── Central error handler ─────────────────────────────────
+// CORS rejections (callback(new Error(...))) and body-parser errors land here.
+// Convert them to a clean JSON response instead of Express's HTML error page,
+// so the frontend can read response.status / response.message / response.error.
+app.use((err, req, res, next) => {
+  const status = err.status || err.statusCode || 500;
+  console.error("[Error-handler]", {
+    status,
+    method: req.method,
+    url: req.originalUrl,
+    origin: req.headers.origin,
+    name: err.name,
+    message: err.message,
+    stack: err.stack,
+  });
+
+  if (err.message === "Not allowed by CORS") {
+    return res.status(403).json({
+      message: "Not allowed by CORS",
+      error: `Origin ${req.headers.origin} is not permitted`,
+    });
+  }
+
+  if (status === 413) {
+    return res.status(413).json({ message: "Payload too large" });
+  }
+
+  res.status(status).json({
+    message: status >= 500 ? "Internal server error" : err.message || "Request failed",
+    error: err.message,
+  });
+});
 
 app.listen(port, () => {
   console.log(`Server running on port ${port}`);

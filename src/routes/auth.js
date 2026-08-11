@@ -222,7 +222,13 @@ router.post("/forgot-password", async (req, res) => {
       message: "If that email is registered, you will receive a password reset link shortly.",
     });
   } catch (error) {
-    console.error("Forgot-password error:", error);
+    console.error("[Forgot-password] error:", {
+      status: 500,
+      name: error.name,
+      message: error.message,
+      stack: error.stack,
+      body: req.body,
+    });
     return res.status(500).json({ message: "Internal server error" });
   }
 });
