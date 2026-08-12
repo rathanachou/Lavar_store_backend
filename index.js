@@ -19,29 +19,31 @@ const { authenticate, authorizeRoles } = require("./src/middlewares/authMiddlewa
 const app  = express();
 const port = process.env.PORT || 3000;
 
-// Read allowed origins from environment (comma-separated) + always-add dev origins
-const envOrigins = (process.env.FRONTEND_URL || "")
-  .split(",")
-  .map((s) => s.trim())
-  .filter(Boolean);
-const devOrigins = [
-  "http://localhost:3000",
-  "http://localhost:5173",
-  "http://localhost:5174",
-  "http://localhost:5175",
-];
-const allowedOrigins = [...new Set([...devOrigins, ...envOrigins])];
+// Allowed origins:
+//  - Exact production URL (from FRONTEND_URL env var)
+//  - Any Vercel preview deployment for this project (lavar-store-*.vercel.app)
+//  - Any localhost origin (dev)
+//  - Requests with no Origin header (server-to-server, curl, Postman)
+const corsOriginPattern = /^https:\/\/lavar-store(-[a-z0-9-]+)?\.vercel\.app$/;
+const frontendUrl = (process.env.FRONTEND_URL || "").trim();
 
-console.log("CORS allowed origins:", allowedOrigins);
+console.log("CORS allowed origins:", [
+  ...(frontendUrl ? [frontendUrl] : []),
+  "http://localhost:*",
+  "https://lavar-store.vercel.app",
+  "https://lavar-store-*.vercel.app (preview)",
+]);
 
 app.use(cors({
   origin: (origin, callback) => {
-    // Allow requests with no origin (server-to-server, curl, etc.)
+    // Allow requests with no origin (server-to-server, curl, Postman)
     if (!origin) return callback(null, true);
     // Allow any localhost origin (dev)
     if (origin.startsWith("http://localhost")) return callback(null, true);
-    // Check against the explicit allow list
-    if (allowedOrigins.includes(origin)) return callback(null, true);
+    // Allow exact production URL if configured
+    if (origin === frontendUrl) return callback(null, true);
+    // Allow any preview deployment: lavar-store-<id>.vercel.app
+    if (corsOriginPattern.test(origin)) return callback(null, true);
     // Log rejected origins for debugging
     console.warn(`CORS blocked origin: ${origin}`);
     callback(new Error("Not allowed by CORS"));
