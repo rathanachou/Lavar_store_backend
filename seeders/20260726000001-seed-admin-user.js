@@ -9,7 +9,7 @@ module.exports = {
       {
         firstName: 'Admin',
         lastName: 'User',
-        email: 'admin@levastore.com',
+        email: 'rathana3296@gmail.com',
         password: await bcrypt.hash('admin123', 10),
         role: 'admin',
         email_verified: true,

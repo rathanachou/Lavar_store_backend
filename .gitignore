@@ -2,3 +2,10 @@
 node_modules
 uploadsconfig/config.json
 config/config.json
+
+# Local Claude Code settings / worktrees
+.claude/
+
+# Runtime logs & backups
+*.log
+*.bak
