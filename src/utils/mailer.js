@@ -13,8 +13,9 @@ function getTransporter() {
     console.log("[Mailer] Creating transporter with host:", process.env.SMTP_HOST, "port:", process.env.SMTP_PORT);
     _transporter = nodemailer.createTransport({
       host: process.env.SMTP_HOST,
-      port: parseInt(process.env.SMTP_PORT || "587", 10),
-      secure: process.env.SMTP_SECURE === "true",
+      port: parseInt(process.env.SMTP_PORT || "465", 10),
+      secure: process.env.SMTP_SECURE !== "false",
+      family: 4,
       auth: {
         user: process.env.SMTP_USER,
         pass: process.env.SMTP_PASS,
