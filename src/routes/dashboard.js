@@ -130,7 +130,7 @@ router.get("/sales/daily", async (req, res) => {
     const date = req.query.date || new Date().toISOString().split("T")[0];
 
     const data = await sequelize.query(
-      `SELECT 
+      `SELECT
         TO_CHAR("createdAt", 'YYYY-MM-DD') AS date,
         SUM(total::numeric) AS "totalSales",
         SUM(discount::numeric) AS "totalDiscount",
@@ -150,8 +150,12 @@ router.get("/sales/daily", async (req, res) => {
       totalOrders: 0,
     };
 
-    const totalSales = Number(row.totalSales) || 0;
+    // Order.total is already NET (discounts applied). So:
+    //   netSales   = SUM(total)          — actual money collected
+    //   grossSales = netSales + totalDiscount — revenue before discounts
+    const netSales     = Number(row.totalSales) || 0;
     const totalDiscount = Number(row.totalDiscount) || 0;
+    const grossSales   = netSales + totalDiscount;
 
     const orders = await Order.findAll({
       where: {
@@ -176,9 +180,9 @@ router.get("/sales/daily", async (req, res) => {
       date,
       summary: {
         totalOrders: Number(row.totalOrders) || orders.length,
-        totalSales: totalSales.toFixed(2),
+        totalSales: grossSales.toFixed(2),
         totalDiscount: totalDiscount.toFixed(2),
-        netSales: (totalSales - totalDiscount).toFixed(2),
+        netSales: netSales.toFixed(2),
       },
       data: orders,
     });

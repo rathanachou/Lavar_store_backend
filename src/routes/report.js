@@ -41,13 +41,18 @@ router.get("/daily-sales", async (req, res) => {
 
     // ── Aggregate ──────────────────────────────────────────
     const paymentMethodBreakdown = { CASH: 0, ABA_PAYWAY: 0, KHQR: 0, OTHER: 0 };
-    let totalRevenue = 0;
+    let totalRevenue = 0;      // net amount actually collected (after discounts)
+    let totalDiscount = 0;     // total customer savings (manual + per-product)
+    let grossSales = 0;        // revenue before any discount
     let totalItemsSold = 0;
     const transactions = [];
 
     for (const order of orders) {
       const orderTotal = Number(order.total) || 0;
+      const orderDiscount = Number(order.discount) || 0;
       totalRevenue += orderTotal;
+      totalDiscount += orderDiscount;
+      grossSales += orderTotal + orderDiscount;
 
       const itemsCount = (order.orderDetails || []).reduce(
         (sum, d) => sum + (Number(d.qty) || 0), 0
@@ -72,6 +77,7 @@ router.get("/daily-sales", async (req, res) => {
         time: order.createdAt,
         itemsCount,
         total: orderTotal,
+        discount: orderDiscount,
         paymentMethod: method,
       });
     }
@@ -85,6 +91,9 @@ router.get("/daily-sales", async (req, res) => {
         totalRevenue: Number(totalRevenue.toFixed(2)),
         totalTransactions,
         totalItemsSold,
+        grossSales: Number(grossSales.toFixed(2)),
+        totalDiscount: Number(totalDiscount.toFixed(2)),
+        netSales: Number(totalRevenue.toFixed(2)),
         paymentMethodBreakdown,
       },
       transactions,
@@ -126,12 +135,15 @@ router.get("/daily-sales/pdf", async (req, res) => {
     }
 
     const paymentMethodBreakdown = { CASH: 0, ABA_PAYWAY: 0, KHQR: 0, OTHER: 0 };
-    let totalRevenue = 0;
+    let totalRevenue = 0;      // net amount actually collected (after discounts)
+    let totalDiscount = 0;     // total customer savings (manual + per-product)
     let totalItemsSold = 0;
 
     for (const order of orders) {
       const orderTotal = Number(order.total) || 0;
+      const orderDiscount = Number(order.discount) || 0;
       totalRevenue += orderTotal;
+      totalDiscount += orderDiscount;
       totalItemsSold += (order.orderDetails || []).reduce(
         (sum, d) => sum + (Number(d.qty) || 0), 0
       );
@@ -195,9 +207,10 @@ router.get("/daily-sales/pdf", async (req, res) => {
     const startX = 40;
 
     const summaryItems = [
-      { label: "Total Revenue",  value: `$${totalRevenue.toFixed(2)}`, color: successColor },
-      { label: "Transactions",   value: String(orders.length),         color: accentColor },
-      { label: "Items Sold",     value: String(totalItemsSold),        color: warningColor },
+      { label: "Total Revenue",  value: `$${totalRevenue.toFixed(2)}`,  color: successColor },
+      { label: "Transactions",   value: String(orders.length),          color: accentColor },
+      { label: "Items Sold",     value: String(totalItemsSold),         color: warningColor },
+      { label: "Discount",       value: `$${totalDiscount.toFixed(2)}`, color: "#d97706" },
     ];
 
     summaryItems.forEach((item, i) => {
@@ -245,9 +258,9 @@ router.get("/daily-sales/pdf", async (req, res) => {
     y += 22;
 
     // Table header
-    const colX = [40, 80, 240, 320, 400, 480];
-    const colW = [40, 160, 80, 80, 80, 65];
-    const headers = ["#", "Order No.", "Items", "Amount", "Method"];
+    const colX = [40, 80, 230, 305, 385, 465, 510];
+    const colW = [40, 150, 75, 80, 80, 45, 35];
+    const headers = ["#", "Order No.", "Items", "Amount", "Discount", "Method"];
 
     // Header background
     doc.roundedRect(40, y, 505, 20, 4).fillColor(primaryColor).fill();
@@ -272,6 +285,7 @@ router.get("/daily-sales/pdf", async (req, res) => {
       const itemsCount = (order.orderDetails || []).reduce(
         (sum, d) => sum + (Number(d.qty) || 0), 0
       );
+      const orderDiscount = Number(order.discount) || 0;
 
       // Alternating row bg
       if (i % 2 === 0) {
@@ -283,7 +297,8 @@ router.get("/daily-sales/pdf", async (req, res) => {
       doc.text(order.orderNumber || "", colX[1] + 4, y + 4, { width: colW[1] });
       doc.text(String(itemsCount),       colX[2] + 4, y + 4, { width: colW[2] });
       doc.text(`$${Number(order.total).toFixed(2)}`, colX[3] + 4, y + 4, { width: colW[3] });
-      doc.text(method,                   colX[4] + 4, y + 4, { width: colW[4] });
+      doc.text(`$${orderDiscount.toFixed(2)}`,        colX[4] + 4, y + 4, { width: colW[4] });
+      doc.text(method,                   colX[5] + 4, y + 4, { width: colW[5] });
       y += 22;
 
       // New page if near end
