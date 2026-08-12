@@ -11,7 +11,13 @@ router.post("/", async (req, res) => {
   const transaction = await sequelize.transaction();
 
   try {
-    const { items, discount } = req.body;
+    const { items, discount, currency } = req.body;
+
+    // Currency the POS charged the customer in. "USD" (default) keeps the USD
+    // ledger; "KHR" also persists the Riel amount paid so the Daily Report can
+    // show it. Reject anything other than USD/KHR to avoid junk values.
+    const paidCurrency = currency === "KHR" ? "KHR" : "USD";
+    const khrRate      = Number(process.env.ABA_PAYWAY_KHR_RATE) || 4100;
 
     if (!items || items.length === 0) {
       await transaction.rollback();
@@ -85,6 +91,13 @@ router.post("/", async (req, res) => {
         status:    "pending",
         orderDate: new Date(),
         location:  "N/A",
+        currency:  paidCurrency,
+        // Convert the final (post-discount) total to whole Riel when charged
+        // in KHR, using the same rate the ABA PayWay charge uses, so the Daily
+        // Report can sum this column directly.
+        amountKhr: paidCurrency === "KHR"
+          ? Math.round(Number(total) * khrRate)
+          : null,
       },
       { transaction }
     );

@@ -45,6 +45,7 @@ router.get("/daily-sales", async (req, res) => {
     let totalDiscount = 0;     // total customer savings (manual + per-product)
     let grossSales = 0;        // revenue before any discount
     let totalItemsSold = 0;
+    let totalRielKhr = 0;      // total Riel collected (from orders charged in KHR)
     const transactions = [];
 
     for (const order of orders) {
@@ -53,6 +54,8 @@ router.get("/daily-sales", async (req, res) => {
       totalRevenue += orderTotal;
       totalDiscount += orderDiscount;
       grossSales += orderTotal + orderDiscount;
+      // KHR orders store the exact Riel amount paid at order create.
+      totalRielKhr += Number(order.amountKhr) || 0;
 
       const itemsCount = (order.orderDetails || []).reduce(
         (sum, d) => sum + (Number(d.qty) || 0), 0
@@ -84,6 +87,9 @@ router.get("/daily-sales", async (req, res) => {
 
     const totalTransactions = orders.length;
 
+    // Rate used to convert KHR → USD equivalent on the frontend Riel card.
+    const usdToKhrRate = Number(process.env.ABA_PAYWAY_KHR_RATE) || 4100;
+
     res.json({
       success: true,
       date,
@@ -94,6 +100,8 @@ router.get("/daily-sales", async (req, res) => {
         grossSales: Number(grossSales.toFixed(2)),
         totalDiscount: Number(totalDiscount.toFixed(2)),
         netSales: Number(totalRevenue.toFixed(2)),
+        rielKhr: Number(totalRielKhr.toFixed(0)),
+        usdToKhrRate,
         paymentMethodBreakdown,
       },
       transactions,
@@ -138,6 +146,7 @@ router.get("/daily-sales/pdf", async (req, res) => {
     let totalRevenue = 0;      // net amount actually collected (after discounts)
     let totalDiscount = 0;     // total customer savings (manual + per-product)
     let totalItemsSold = 0;
+    let totalRielKhr = 0;      // total Riel collected (from orders charged in KHR)
 
     for (const order of orders) {
       const orderTotal = Number(order.total) || 0;
@@ -147,6 +156,7 @@ router.get("/daily-sales/pdf", async (req, res) => {
       totalItemsSold += (order.orderDetails || []).reduce(
         (sum, d) => sum + (Number(d.qty) || 0), 0
       );
+      totalRielKhr += Number(order.amountKhr) || 0;
 
       const payment = paymentMap[order.id];
       let method = "OTHER";
@@ -200,8 +210,8 @@ router.get("/daily-sales/pdf", async (req, res) => {
        .text("Summary", 40, y);
     y += 22;
 
-    // Summary boxes
-    const boxW = 120;
+    // Summary boxes — width adapts to the count so all fit on one A4 row
+    // (505pt content width) even with the Riel box added.
     const boxH = 52;
     const gap = 12;
     const startX = 40;
@@ -212,6 +222,17 @@ router.get("/daily-sales/pdf", async (req, res) => {
       { label: "Items Sold",     value: String(totalItemsSold),         color: warningColor },
       { label: "Discount",       value: `$${totalDiscount.toFixed(2)}`, color: "#d97706" },
     ];
+
+    // Only show the Riel summary box when any KHR was collected that day.
+    if (totalRielKhr > 0) {
+      summaryItems.push({
+        label: "Riel (៛)",
+        value: `៛${Math.round(totalRielKhr).toLocaleString("en-US")}`,
+        color: "#0f766e",
+      });
+    }
+
+    const boxW = Math.min(120, (505 - gap * (summaryItems.length - 1)) / summaryItems.length);
 
     summaryItems.forEach((item, i) => {
       const x = startX + i * (boxW + gap);
@@ -247,6 +268,16 @@ router.get("/daily-sales/pdf", async (req, res) => {
          .text(displayName, 50, y + 6);
       doc.fontSize(10).font("Helvetica-Bold").fillColor(methodColors[method] || grayColor)
          .text(`$${amountNum.toFixed(2)}`, 480, y + 6, { align: "right" });
+      y += 30;
+    }
+
+    // Riel collected that day (when any KHR payment happened).
+    if (totalRielKhr > 0) {
+      doc.roundedRect(40, y, 505, 24, 4).fillColor("#ccfbf1").fill();
+      doc.fontSize(10).font("Helvetica-Bold").fillColor("#0f766e")
+         .text("Riel (៛)", 50, y + 6);
+      doc.fontSize(10).font("Helvetica-Bold").fillColor("#0f766e")
+         .text(`៛${Math.round(totalRielKhr).toLocaleString("en-US")}`, 480, y + 6, { align: "right" });
       y += 30;
     }
 

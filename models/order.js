@@ -52,6 +52,22 @@ module.exports = (sequelize, DataTypes) => {
         allowNull:    true,
         defaultValue: "N/A",
       },
+      // Currency the customer actually paid in at the POS ("USD" | "KHR").
+      // The store's ledger/Order.total is always USD; this records the display
+      // currency chosen at checkout so the Daily Report can show Riel totals.
+      currency: {
+        type:         DataTypes.STRING,
+        allowNull:    false,
+        defaultValue: "USD",
+      },
+      // Riel amount paid when currency = "KHR"; NULL for USD orders.
+      // DECIMAL(12,0) because Riel has no cents. Pre-converted at order create
+      // using ABA_PAYWAY_KHR_RATE so the report never needs to convert.
+      amountKhr: {
+        type:         DataTypes.DECIMAL(12, 0),
+        field:        "amount_khr",
+        allowNull:    true,
+      },
       cancelledAt: {
         type:      DataTypes.DATE,
         allowNull: true,
