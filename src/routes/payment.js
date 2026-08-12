@@ -42,6 +42,16 @@ router.post("/:orderId", async (req, res) => {
 
     const req_time = getReqTime();
 
+    // ── Dynamic redirect base ─────────────────────────────────────
+    // The frontend sends its current origin (window.location.origin) so the
+    // payment gateway redirects back to the correct environment — localhost
+    // during dev, production in deploy.  Fall back to FRONTEND_URL for
+    // backward compatibility (e.g. direct API calls without an origin).
+    const redirectBase =
+      (req.body.origin || "").trim() ||
+      (process.env.FRONTEND_URL || "").trim();
+    // ──────────────────────────────────────────────────────────────
+
     // Convert USD order.total → whole-number KHR for ABA PayWay (sandbox merchant
     // ec476939 is KHR-based). Rate is env-driven so it can be updated without a deploy.
     const khrRate    = Number(process.env.ABA_PAYWAY_KHR_RATE) || 4100;
@@ -70,9 +80,9 @@ router.post("/:orderId", async (req, res) => {
       type:                 "purchase",
       view_type:            "popup",
       payment_option:       "abapay_khqr",
-      return_url:           `${process.env.FRONTEND_URL}/admin/pos`,
-      cancel_url:           `${process.env.FRONTEND_URL}/admin/pos`,
-      continue_success_url: `${process.env.FRONTEND_URL}/admin/pos?tranId=${paywayTranId}`,
+      return_url:           `${redirectBase}/admin/pos`,
+      cancel_url:           `${redirectBase}/admin/pos`,
+      continue_success_url: `${redirectBase}/admin/pos?tranId=${paywayTranId}`,
       currency:             "KHR",
       payment_gate:         0,
       return_deeplink:      "",
