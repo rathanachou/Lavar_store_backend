@@ -32,6 +32,41 @@ async function syncProductFromBatches(productId, { transaction } = {}) {
 }
 
 /**
+ * Resolve the "soonest qty>0 batch" for a product — the SAME lookup that
+ * syncProductFromBatches uses to derive Product.expireDate. Callers should use
+ * this instead of trusting a possibly-stale Product.expireDate when batches may
+ * have changed since the last sync. Returns the batch row or null.
+ */
+async function getSoonestBatch(productId, { transaction } = {}) {
+  return ProductBatch.findOne({
+    where: { productId, qty: { [Op.gt]: 0 } },
+    order: [["expireDate", "ASC NULLS LAST"]],
+    transaction,
+  });
+}
+
+/**
+ * A product is "expired" when its soonest sellable batch (qty > 0) has an
+ * expire_date strictly before today. Batches with no expiry are never expired,
+ * and batches expiring today are still sellable. The check is derived live from
+ * ProductBatches so it never depends on a stale Product.expireDate cache.
+ *
+ * @returns {Promise<boolean>}
+ */
+async function isExpired(productId, { transaction } = {}) {
+  const soonest = await getSoonestBatch(productId, { transaction });
+
+  // No sellable batch (out of stock) or a batch with no expiry → not expired.
+  if (!soonest || !soonest.expireDate) return false;
+
+  const expire = new Date(`${soonest.expireDate}T00:00:00`);
+  const today  = new Date();
+  today.setHours(0, 0, 0, 0);
+
+  return expire < today;
+}
+
+/**
  * Add received stock as a new batch (e.g. receiving goods, stock-in, or the
  * initial stock when creating a product). Optionally carries expiry, lot
  * number, and per-batch cost price.
@@ -130,4 +165,6 @@ module.exports = {
   addStockToBatch,
   deductStockFifo,
   restoreStockToBatch,
+  getSoonestBatch,
+  isExpired,
 };

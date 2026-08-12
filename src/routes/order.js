@@ -2,6 +2,7 @@ const express = require("express");
 const { Order, Customer, OrderDetail, Product } = require("../../models");
 const { sendTelegramMessage, formatOrderMessage } = require("../utils/telegram");
 const { sequelize } = require("../../models");
+const { deductStockFifo, restoreStockToBatch, isExpired } = require("../utils/batchStock");
 
 const router = express.Router();
 
@@ -18,7 +19,9 @@ router.post("/", async (req, res) => {
     }
 
     const orderDetailsData = [];
-    let total = 0;
+    let subtotal = 0;               // sum of line amounts AFTER per-product discount
+    let productDiscountTotal = 0;   // sum of per-product (near-expiry) discounts
+    let total    = 0;               // final total after per-product + manual discount
 
     for (const item of items) {
       const productId = Number(item.productId);
@@ -31,6 +34,17 @@ router.post("/", async (req, res) => {
         return res.status(404).json({ success: false, message: `Product id=${productId} not found` });
       }
 
+      //  Block expired products — checked live against the soonest qty>0 batch
+      //  (same logic as syncProductFromBatches) so batches changed since the last
+      //  sync can't slip a stale Product.expireDate through.
+      if (await isExpired(product.id, { transaction })) {
+        await transaction.rollback();
+        return res.status(400).json({
+          success: false,
+          message: `Product "${product.name}" is expired and cannot be sold`,
+        });
+      }
+
       //  Check stock but do NOT deduct yet
       if (product.qty < qty) {
         await transaction.rollback();
@@ -41,11 +55,25 @@ router.post("/", async (req, res) => {
       }
 
       const productPrice = Number(product.price);
-      const amount       = productPrice * qty;
-      total += amount;
+      const rawAmount    = productPrice * qty;
 
-      orderDetailsData.push({ productId, productName: product.name, productPrice, qty, amount });
+      // Apply near-expiry product discount (discount_percent) if present
+      const percent = Number(product.discountPercent) || 0;
+      const amount  = percent > 0 ? rawAmount * (1 - percent / 100) : rawAmount;
+      // Persist the per-line discount so receipts/reports can surface it.
+      const lineDiscount = Math.max(0, rawAmount - amount);
+
+      subtotal += amount;
+      productDiscountTotal += lineDiscount;
+      orderDetailsData.push({ productId, productName: product.name, productPrice, qty, amount, discount: lineDiscount });
     }
+
+    // Manual flat discount (from checkout) applies on top of per-product discounts.
+    // Order.discount holds the TOTAL discount (manual + per-product) so reports
+    // summing the column reflect the full amount customers saved.
+    const manualDiscount = Number(discount) || 0;
+    const totalDiscount  = manualDiscount + productDiscountTotal;
+    total = Math.max(0, subtotal - manualDiscount);
 
     const orderNumber  = generateInvoiceNumber();
     const createdOrder = await Order.create(
@@ -53,7 +81,7 @@ router.post("/", async (req, res) => {
         customerId: null,
         orderNumber,
         total:     Number(total.toFixed(2)),
-        discount:  Number(discount) || 0,
+        discount:  Number(totalDiscount.toFixed(2)),
         status:    "pending",
         orderDate: new Date(),
         location:  "N/A",
@@ -68,6 +96,7 @@ router.post("/", async (req, res) => {
       productPrice: d.productPrice,
       qty:          d.qty,
       amount:       d.amount,
+      discount:     d.discount,
     }));
 
     await OrderDetail.bulkCreate(detailsToInsert, { transaction, validate: true });
@@ -125,6 +154,16 @@ router.post("/:id/confirm", async (req, res) => {
         return res.status(404).json({ success: false, message: `Product id=${detail.productId} not found` });
       }
 
+      //  Block expired products at confirm time too (defense in depth: stock was
+      //  checked but not deducted at order creation, so batches may have changed).
+      if (await isExpired(detail.productId, { transaction })) {
+        await transaction.rollback();
+        return res.status(400).json({
+          success: false,
+          message: `Product "${product.name}" is expired and cannot be sold`,
+        });
+      }
+
       if (product.qty < detail.qty) {
         await transaction.rollback();
         return res.status(400).json({
@@ -133,7 +172,8 @@ router.post("/:id/confirm", async (req, res) => {
         });
       }
 
-      await product.update({ qty: product.qty - detail.qty }, { transaction });
+      // Deduct FIFO (soonest-expiring batch first)
+      await deductStockFifo(detail.productId, detail.qty, { transaction });
     }
 
     await order.update({ status: "completed" }, { transaction });
@@ -200,7 +240,8 @@ router.patch("/:id/cancel", async (req, res) => {
       for (const detail of order.orderDetails) {
         const product = await Product.findByPk(detail.productId, { transaction });
         if (product) {
-          await product.update({ qty: product.qty + detail.qty }, { transaction });
+          // Return to the batch FIFO would have deducted next (or a new batch)
+          await restoreStockToBatch(detail.productId, detail.qty, { transaction });
         }
       }
     }
