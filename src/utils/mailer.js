@@ -1,4 +1,16 @@
 const nodemailer = require("nodemailer");
+const dns = require("dns");
+
+// Force DNS resolution to IPv4 only — Render has no outbound IPv6 route,
+// and nodemailer's `family` socket option alone isn't reliable with
+// secure:true (TLS uses tls.connect(), which can still resolve AAAA first).
+const lookupIPv4 = (hostname, options, callback) => {
+  if (typeof options === "function") {
+    callback = options;
+    options = {};
+  }
+  dns.lookup(hostname, { ...options, family: 4 }, callback);
+};
 
 // Debug: verify env vars are loaded before first use
 console.log("[Mailer] SMTP_HOST =", process.env.SMTP_HOST);
@@ -15,7 +27,7 @@ function getTransporter() {
       host: process.env.SMTP_HOST,
       port: parseInt(process.env.SMTP_PORT || "465", 10),
       secure: process.env.SMTP_SECURE !== "false",
-      family: 4,
+      lookup: lookupIPv4,
       auth: {
         user: process.env.SMTP_USER,
         pass: process.env.SMTP_PASS,
