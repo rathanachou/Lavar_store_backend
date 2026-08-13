@@ -76,7 +76,7 @@ app.use("/api/v1/payments",   authenticate, paymentRoute);
 // ─── Admin Only ────────────────────────────────────────────────────────────
 app.use("/api/v1/users",     authenticate, authorizeRoles("admin"), userRoute);
 app.use("/api/v1/dashboard", authenticate, authorizeRoles("admin"), dashboardRoute);
-app.use("/api/v1/reports",   authenticate, authorizeRoles("admin"), reportRoute);
+app.use("/api/v1/reports",   authenticate, authorizeRoles("admin", "cashier"), reportRoute);
 
 // ─── Central error handler ─────────────────────────────────
 // CORS rejections (callback(new Error(...))) and body-parser errors land here.

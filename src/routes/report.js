@@ -3,13 +3,18 @@ const { Order, OrderDetail, Payment, sequelize } = require("../../models");
 const { Op, fn, col } = require("sequelize");
 const PDFDocument = require("pdfkit");
 const dayjs = require("dayjs");
+const { requireRole } = require("../../middlewares/requireRole");
 
 const router = express.Router();
 
 // ─── GET: Daily Sales Report JSON ──────────────────────────
 router.get("/daily-sales", async (req, res) => {
   try {
-    const date = req.query.date || dayjs().format("YYYY-MM-DD");
+    // Cashiers may only view today's report — ignore any date they send.
+    const isCashier = req.user?.role === "cashier";
+    const date = isCashier
+      ? dayjs().format("YYYY-MM-DD")
+      : (req.query.date || dayjs().format("YYYY-MM-DD"));
 
     const dayStart = new Date(`${date}T00:00:00.000Z`);
     const dayEnd   = new Date(`${date}T23:59:59.999Z`);
@@ -116,7 +121,11 @@ router.get("/daily-sales", async (req, res) => {
 // ─── GET: Download Daily Sales Report PDF ──────────────────
 router.get("/daily-sales/pdf", async (req, res) => {
   try {
-    const date = req.query.date || dayjs().format("YYYY-MM-DD");
+    // Cashiers may only download today's report.
+    const isCashier = req.user?.role === "cashier";
+    const date = isCashier
+      ? dayjs().format("YYYY-MM-DD")
+      : (req.query.date || dayjs().format("YYYY-MM-DD"));
 
     // Reuse the same logic by fetching report data
     const dayStart = new Date(`${date}T00:00:00.000Z`);
@@ -365,8 +374,8 @@ router.get("/daily-sales/pdf", async (req, res) => {
   }
 });
 
-// ─── GET: Monthly Sales Report JSON ─────────────────────────
-router.get("/monthly-sales", async (req, res) => {
+// ─── GET: Monthly Sales Report JSON (admin only) ────────────
+router.get("/monthly-sales", requireRole("admin"), async (req, res) => {
   try {
     const year  = Number(req.query.year)  || dayjs().year();
     const month = String(req.query.month || dayjs().month() + 1).padStart(2, "0");
@@ -460,8 +469,8 @@ router.get("/monthly-sales", async (req, res) => {
   }
 });
 
-// ─── GET: Download Monthly Sales Report PDF ─────────────────
-router.get("/monthly-sales/pdf", async (req, res) => {
+// ─── GET: Download Monthly Sales Report PDF (admin only) ───
+router.get("/monthly-sales/pdf", requireRole("admin"), async (req, res) => {
   try {
     const year  = Number(req.query.year)  || dayjs().year();
     const month = String(req.query.month || dayjs().month() + 1).padStart(2, "0");
