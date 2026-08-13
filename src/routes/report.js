@@ -3,7 +3,7 @@ const { Order, OrderDetail, Payment, sequelize } = require("../../models");
 const { Op, fn, col } = require("sequelize");
 const PDFDocument = require("pdfkit");
 const dayjs = require("dayjs");
-const { requireRole } = require("../../middlewares/requireRole");
+const requireRole = require("../middlewares/requireRole");
 
 const router = express.Router();
 
