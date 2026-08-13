@@ -24,7 +24,18 @@ const authorizeRoles = (...roles) => {
       return res.status(401).json({ message: "Unauthorized" });
     }
 
-    if (!roles.includes(req.user.role)) {
+    // Tokens issued before the role migration have no role claim.
+    // Return 401 so the frontend clears the stale token and prompts re-login,
+    // instead of a 403 that leaves the user stuck with a forever-invalid token.
+    if (!req.user.role) {
+      return res.status(401).json({
+        message: "Session expired — please log in again to refresh your permissions.",
+      });
+    }
+
+    const hasRole = roles.includes(req.user.role);
+
+    if (!hasRole) {
       return res.status(403).json({
         message: `Access denied. Required role: ${roles.join(" or ")}`,
       });
