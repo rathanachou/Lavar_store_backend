@@ -1,10 +1,10 @@
 const express = require("express");
 const fs = require("fs");
 const path = require("path");
-const { Product, ProductImage, ProductBatch, Category } = require("../../models");
+const { Product, ProductImage, ProductBatch, Category, sequelize } = require("../../models");
 const { Op, fn, col, where } = require("sequelize");
 const generateBarcodePDF = require('../utils/generateBarcodePDF');
-const { addStockToBatch, deductStockFifo, syncProductFromBatches } = require('../utils/batchStock');
+const { addStockToBatch, deductStockFifo, syncProductFromBatches, createStockMovement, updateInventoryForBatch, ensureInventoryForBatch } = require('../utils/batchStock');
 const { authenticate, authorizeRoles } = require("../middlewares/authMiddleware");
 const router = express.Router();
 const { storage, cloudinary } = require('../storage/storage')
@@ -284,13 +284,16 @@ router.post('/barcodes/print', authenticate, authorizeRoles('admin'), async (req
 // ─── POST: Add Product Batch (admin/cashier) ─────────────
 // Body: { qty, expire_date?, batch_number?, cost_price? }
 // Adds received stock as a new batch instead of just bumping Product.qty.
+// Also creates Inventory row and PURCHASE stock movement.
 router.post("/:id/batches", async (req, res) => {
+  const transaction = await sequelize.transaction();
   try {
     const { id } = req.params;
     const { qty, expire_date, batch_number, cost_price } = req.body;
 
-    const product = await Product.findByPk(id);
+    const product = await Product.findByPk(id, { transaction });
     if (!product) {
+      await transaction.rollback();
       return res.status(404).json({
         success: false,
         message: `Product id=${id} not found`,
@@ -298,6 +301,7 @@ router.post("/:id/batches", async (req, res) => {
     }
 
     if (!qty || isNaN(qty) || Number(qty) <= 0) {
+      await transaction.rollback();
       return res.status(400).json({
         success: false,
         message: "qty must be a positive number",
@@ -311,8 +315,27 @@ router.post("/:id/batches", async (req, res) => {
         expireDate: expire_date || null,
         batchNumber: batch_number || null,
         costPrice: cost_price,
+      },
+      { transaction }
+    );
+
+    // Create Inventory record and PURCHASE movement
+    await ensureInventoryForBatch(batch.id, { transaction });
+    await updateInventoryForBatch(batch.id, Number(qty), 0, { transaction });
+    await createStockMovement(
+      id,
+      batch.id,
+      "PURCHASE",
+      Number(qty),
+      {
+        userId: req.user ? req.user.id : null,
+        referenceId: `batch:${batch.id}`,
+        reason:      "Stock received",
+        transaction,
       }
     );
+
+    await transaction.commit();
 
     res.status(201).json({
       success: true,
@@ -320,6 +343,7 @@ router.post("/:id/batches", async (req, res) => {
       data: batch,
     });
   } catch (error) {
+    await transaction.rollback();
     console.error("Add batch error:", error);
     res.status(500).json({ success: false, message: "Internal server error" });
   }
@@ -357,12 +381,15 @@ router.get("/:id/batches", async (req, res) => {
 });
 
 // ─── DELETE: Remove a Product Batch (admin only) ─────────
+// Creates an ADJUSTMENT movement recording the deleted qty before removal.
 router.delete("/batches/:batchId", authenticate, authorizeRoles("admin"), async (req, res) => {
+  const transaction = await sequelize.transaction();
   try {
     const { batchId } = req.params;
 
-    const batch = await ProductBatch.findByPk(batchId);
+    const batch = await ProductBatch.findByPk(batchId, { transaction });
     if (!batch) {
+      await transaction.rollback();
       return res.status(404).json({
         success: false,
         message: `Batch id=${batchId} not found`,
@@ -370,14 +397,37 @@ router.delete("/batches/:batchId", authenticate, authorizeRoles("admin"), async 
     }
 
     const productId = batch.productId;
-    await batch.destroy();
-    await syncProductFromBatches(productId);
+    const deletedQty = Number(batch.qty);
+
+    // Record the adjustment before destroying the batch
+    await createStockMovement(
+      productId,
+      batch.id,
+      "ADJUSTMENT",
+      -deletedQty,
+      {
+        userId: req.user ? req.user.id : null,
+        referenceId: `batch:${batch.id}`,
+        reason:      "Batch deleted",
+        transaction,
+      }
+    );
+
+    // Remove inventory record if it exists
+    const inv = await Inventory.findOne({ where: { batchId: batch.id }, transaction });
+    if (inv) await inv.destroy({ transaction });
+
+    await batch.destroy({ transaction });
+    await syncProductFromBatches(productId, { transaction });
+
+    await transaction.commit();
 
     res.json({
       success: true,
       message: "Batch deleted successfully",
     });
   } catch (error) {
+    await transaction.rollback();
     console.error("Delete batch error:", error);
     res.status(500).json({ success: false, message: "Internal server error" });
   }
@@ -437,10 +487,12 @@ router.get('/:id/barcode/print', async (req, res) => {
 
 // ─── POST: Create Product (admin only) ───────────────────
 router.post("/", authenticate, authorizeRoles("admin"), async (req, res) => {
+  const transaction = await sequelize.transaction();
   try {
     const { name, price, categoryId, isActive, qty, barcode, sku, expireDate, expire_date } = req.body;
 
     if (!name || !price || !categoryId) {
+      await transaction.rollback();
       return res.status(400).json({
         success: false,
         message: "name, price, categoryId are required",
@@ -456,19 +508,38 @@ router.post("/", authenticate, authorizeRoles("admin"), async (req, res) => {
       barcode: barcode || null,
       sku: sku || null,
       expireDate: expireDate ?? expire_date ?? null,
-    });
+    }, { transaction });
 
     // Keep the batch table as source of truth: seed an initial batch for any
     // starting stock so Products.qty = SUM(ProductBatches.qty) always holds.
     if (Number(qty) > 0) {
-      await addStockToBatch(
+      const batch = await addStockToBatch(
         createdProduct.id,
         {
           qty: Number(qty),
           expireDate: expireDate ?? expire_date ?? null,
+        },
+        { transaction }
+      );
+
+      // Initialize Inventory and create PURCHASE movement
+      await ensureInventoryForBatch(batch.id, { transaction });
+      await updateInventoryForBatch(batch.id, Number(qty), 0, { transaction });
+      await createStockMovement(
+        createdProduct.id,
+        batch.id,
+        "PURCHASE",
+        Number(qty),
+        {
+          userId: req.user ? req.user.id : null,
+          referenceId: `product:${createdProduct.id}`,
+          reason:      "Initial stock on product creation",
+          transaction,
         }
       );
     }
+
+    await transaction.commit();
 
     res.status(201).json({
       success: true,
@@ -476,6 +547,7 @@ router.post("/", authenticate, authorizeRoles("admin"), async (req, res) => {
       data: createdProduct,
     });
   } catch (error) {
+    await transaction.rollback();
     console.error("Create product error:", error);
     res.status(500).json({ success: false, message: "Internal server error" });
   }
@@ -606,12 +678,14 @@ router.delete("/:id", authenticate, authorizeRoles("admin"), async (req, res) =>
 
 // ─── PUT: Update Product (admin only) ────────────────────
 router.put("/:id", authenticate, authorizeRoles("admin"), async (req, res) => {
+  const transaction = await sequelize.transaction();
   try {
     const { id } = req.params;
     const { name, price, categoryId, isActive, qty, barcode, sku, expireDate, expire_date } = req.body;
 
-    const product = await Product.findByPk(id);
+    const product = await Product.findByPk(id, { transaction });
     if (!product) {
+      await transaction.rollback();
       return res.status(404).json({
         success: false,
         message: `Product id=${id} not found`,
@@ -635,39 +709,86 @@ router.put("/:id", authenticate, authorizeRoles("admin"), async (req, res) => {
       barcode: barcode || null,
       sku: sku || null,
       expireDate: nextExpireDate,
-    });
+    }, { transaction });
 
     // Reconcile the denormalized Product.qty field against the batch table.
     // Batches are the source of truth; if the form's qty differs from the sum
     // of batch quantities, add or deduct the difference so the invariant holds.
     const requestedQty = Number(qty) || 0;
-    const batches = await ProductBatch.findAll({ where: { productId: id } });
+    const batches = await ProductBatch.findAll({ where: { productId: id }, transaction });
     const sumQty = batches.reduce((s, b) => s + Number(b.qty), 0);
     const delta = requestedQty - sumQty;
 
     if (delta > 0) {
-      await addStockToBatch(id, { qty: delta, expireDate: nextExpireDate });
+      const batch = await addStockToBatch(id, { qty: delta, expireDate: nextExpireDate }, { transaction });
+      // Initialize Inventory and create PURCHASE movement for the new batch stock
+      await ensureInventoryForBatch(batch.id, { transaction });
+      await updateInventoryForBatch(batch.id, delta, 0, { transaction });
+      await createStockMovement(
+        id,
+        batch.id,
+        "PURCHASE",
+        delta,
+        {
+          userId: req.user ? req.user.id : null,
+          referenceId: `update:product:${id}`,
+          reason:      "Product qty update (increase)",
+          transaction,
+        }
+      );
       // A form-set expireDate must win over any older batch expiry, so stamp
       // every qty>0 batch with it; otherwise the sync below prefers the
       // soonest existing batch and the saved value would be clobbered.
       if (expireFieldProvided && nextExpireDate) {
         await ProductBatch.update(
           { expireDate: nextExpireDate },
-          { where: { productId: id, qty: { [Op.gt]: 0 } } }
+          { where: { productId: id, qty: { [Op.gt]: 0 } }, transaction }
         );
       }
-      await syncProductFromBatches(id);
+      await syncProductFromBatches(id, { transaction });
     } else if (delta < 0) {
-      await deductStockFifo(id, Math.abs(delta));
+      const absDelta = Math.abs(delta);
+      // Replicate FIFO deduction with per-batch tracking
+      const batchRows = await ProductBatch.findAll({
+        where: { productId: id, qty: { [Op.gt]: 0 } },
+        order: [["expireDate", "ASC NULLS LAST"]],
+        transaction,
+      });
+
+      let remaining = absDelta;
+      for (const batch of batchRows) {
+        if (remaining <= 0) break;
+        const take = Math.min(Number(batch.qty), remaining);
+        await batch.update({ qty: Number(batch.qty) - take }, { transaction });
+        await updateInventoryForBatch(batch.id, -take, 0, { transaction });
+        await createStockMovement(
+          id,
+          batch.id,
+          "ADJUSTMENT",
+          -take,
+          {
+            userId: req.user ? req.user.id : null,
+            referenceId: `update:product:${id}`,
+            reason:      "Product qty update (decrease)",
+            transaction,
+          }
+        );
+        remaining -= take;
+      }
+
+      if (remaining > 0) {
+        throw new Error(`Insufficient stock for product id=${id} during update`);
+      }
+
       // Same batch reconciliation as the other branches so a form-set or
       // form-cleared expireDate survives even when stock was deducted.
       if (expireFieldProvided) {
         await ProductBatch.update(
           { expireDate: nextExpireDate },
-          { where: { productId: id, qty: { [Op.gt]: 0 } } }
+          { where: { productId: id, qty: { [Op.gt]: 0 } }, transaction }
         );
-        await syncProductFromBatches(id);
       }
+      await syncProductFromBatches(id, { transaction });
     } else {
       // qty already matches — reconcile the batch that drives the expire_date
       // cache so the form value (set or cleared) survives the sync below
@@ -675,12 +796,14 @@ router.put("/:id", authenticate, authorizeRoles("admin"), async (req, res) => {
       if (expireFieldProvided) {
         await ProductBatch.update(
           { expireDate: nextExpireDate },
-          { where: { productId: id, qty: { [Op.gt]: 0 } } }
+          { where: { productId: id, qty: { [Op.gt]: 0 } }, transaction }
         );
       }
       // Refresh expire_date cache from batches (sooner batch wins).
-      await syncProductFromBatches(id);
+      await syncProductFromBatches(id, { transaction });
     }
+
+    await transaction.commit();
 
     const updatedProduct = await Product.findByPk(id, {
       include: [{ model: Category, as: "category" }],
@@ -692,26 +815,31 @@ router.put("/:id", authenticate, authorizeRoles("admin"), async (req, res) => {
       data: updatedProduct,
     });
   } catch (error) {
+    await transaction.rollback();
     console.error("Update product error:", error);
     res.status(500).json({ success: false, message: "Internal server error" });
   }
 });
 
 // ─── PATCH: Stock In (admin only) ────────────────────────
+// Creates a new batch, updates Inventory, and creates a PURCHASE movement.
 router.patch("/:id/stock/in", authenticate, authorizeRoles("admin"), async (req, res) => {
+  const transaction = await sequelize.transaction();
   try {
     const { id } = req.params;
     const { qty } = req.body;
 
     if (!qty || isNaN(qty) || Number(qty) <= 0) {
+      await transaction.rollback();
       return res.status(400).json({
         success: false,
         message: "qty must be a positive number",
       });
     }
 
-    const product = await Product.findByPk(id);
+    const product = await Product.findByPk(id, { transaction });
     if (!product) {
+      await transaction.rollback();
       return res.status(404).json({
         success: false,
         message: `Product id=${id} not found`,
@@ -721,7 +849,25 @@ router.patch("/:id/stock/in", authenticate, authorizeRoles("admin"), async (req,
     const oldQty = product.qty;
 
     // Add as a new batch (no expiry) — batches are the source of truth.
-    await addStockToBatch(id, { qty: Number(qty) });
+    const batch = await addStockToBatch(id, { qty: Number(qty) }, { transaction });
+
+    // Update Inventory and create PURCHASE movement
+    await ensureInventoryForBatch(batch.id, { transaction });
+    await updateInventoryForBatch(batch.id, Number(qty), 0, { transaction });
+    await createStockMovement(
+      id,
+      batch.id,
+      "PURCHASE",
+      Number(qty),
+      {
+        userId: req.user ? req.user.id : null,
+        referenceId: `stockIn:${batch.id}`,
+        reason:      "Manual stock in",
+        transaction,
+      }
+    );
+
+    await transaction.commit();
 
     const updated = await Product.findByPk(id);
     const newQty = updated.qty;
@@ -738,26 +884,32 @@ router.patch("/:id/stock/in", authenticate, authorizeRoles("admin"), async (req,
       },
     });
   } catch (error) {
+    await transaction.rollback();
     console.error("Stock in error:", error);
     res.status(500).json({ success: false, message: "Internal server error" });
   }
 });
 
 // ─── PATCH: Stock Out (admin only) ───────────────────────
+// Deducts FIFO from batches, updates Inventory, and creates ADJUSTMENT
+// movements for each batch affected.
 router.patch("/:id/stock/out", authenticate, authorizeRoles("admin"), async (req, res) => {
+  const transaction = await sequelize.transaction();
   try {
     const { id } = req.params;
     const { qty } = req.body;
 
     if (!qty || isNaN(qty) || Number(qty) <= 0) {
+      await transaction.rollback();
       return res.status(400).json({
         success: false,
         message: "qty must be a positive number",
       });
     }
 
-    const product = await Product.findByPk(id);
+    const product = await Product.findByPk(id, { transaction });
     if (!product) {
+      await transaction.rollback();
       return res.status(404).json({
         success: false,
         message: `Product id=${id} not found`,
@@ -765,6 +917,7 @@ router.patch("/:id/stock/out", authenticate, authorizeRoles("admin"), async (req
     }
 
     if (Number(qty) > product.qty) {
+      await transaction.rollback();
       return res.status(400).json({
         success: false,
         message: `Insufficient stock. Available: ${product.qty}, Requested: ${qty}`,
@@ -772,9 +925,45 @@ router.patch("/:id/stock/out", authenticate, authorizeRoles("admin"), async (req
     }
 
     const oldQty = product.qty;
+    const outQty = Number(qty);
 
     // Deduct FIFO (soonest-expiring batch first) — batches are the source of truth.
-    await deductStockFifo(id, Number(qty));
+    // We replicate the FIFO logic here so we can track which batches were affected
+    // and create per-batch ADJUSTMENT movements + inventory updates.
+    const { Op } = require("sequelize");
+    const batches = await ProductBatch.findAll({
+      where: { productId: id, qty: { [Op.gt]: 0 } },
+      order: [["expireDate", "ASC NULLS LAST"]],
+      transaction,
+    });
+
+    let remaining = outQty;
+    for (const batch of batches) {
+      if (remaining <= 0) break;
+      const take = Math.min(Number(batch.qty), remaining);
+      await batch.update({ qty: Number(batch.qty) - take }, { transaction });
+      await updateInventoryForBatch(batch.id, -take, 0, { transaction });
+      await createStockMovement(
+        id,
+        batch.id,
+        "ADJUSTMENT",
+        -take,
+        {
+          userId: req.user ? req.user.id : null,
+          referenceId: `stockOut:product:${id}`,
+          reason:      "Manual stock out",
+          transaction,
+        }
+      );
+      remaining -= take;
+    }
+
+    if (remaining > 0) {
+      throw new Error(`Insufficient stock for product id=${id}`);
+    }
+
+    await syncProductFromBatches(id, { transaction });
+    await transaction.commit();
 
     const updated = await Product.findByPk(id);
     const newQty = updated.qty;
@@ -786,11 +975,12 @@ router.patch("/:id/stock/out", authenticate, authorizeRoles("admin"), async (req
         productId:   product.id,
         name:        product.name,
         previousQty: oldQty,
-        removedQty:  Number(qty),
+        removedQty:  outQty,
         currentQty:  newQty,
       },
     });
   } catch (error) {
+    await transaction.rollback();
     console.error("Stock out error:", error);
     res.status(500).json({ success: false, message: "Internal server error" });
   }

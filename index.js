@@ -13,6 +13,9 @@ const dashboardRoute = require("./src/routes/dashboard");
 const paymentRoute   = require("./src/routes/payment");
 const settingsRoute  = require("./src/routes/settings");
 const reportRoute    = require("./src/routes/report");
+const inventoryRoute     = require("./src/routes/inventory");
+const stockMovementRoute = require("./src/routes/stockmovement");
+const batchRoute         = require("./src/routes/batch");
 
 const { authenticate, authorizeRoles } = require("./src/middlewares/authMiddleware");
 
@@ -77,6 +80,13 @@ app.use("/api/v1/payments",   authenticate, paymentRoute);
 app.use("/api/v1/users",     authenticate, authorizeRoles("admin"), userRoute);
 app.use("/api/v1/dashboard", authenticate, authorizeRoles("admin"), dashboardRoute);
 app.use("/api/v1/reports",   authenticate, authorizeRoles("admin", "cashier"), reportRoute);
+
+// ─── Inventory & Stock Movements (authenticated) ────────
+app.use("/api/v1/inventory",       authenticate, inventoryRoute);
+app.use("/api/v1/stock-movements", authenticate, stockMovementRoute);
+
+// ─── Batch (read-only lookup, authenticated) ─────────────
+app.use("/api/v1/batches", authenticate, batchRoute);
 
 // ─── Central error handler ─────────────────────────────────
 // CORS rejections (callback(new Error(...))) and body-parser errors land here.

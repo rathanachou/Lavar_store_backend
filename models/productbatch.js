@@ -7,6 +7,10 @@ module.exports = (sequelize, DataTypes) => {
         foreignKey: "productId",
         as: "product",
       });
+      ProductBatch.hasOne(models.Inventory, {
+        foreignKey: "batchId",
+        as: "inventory",
+      });
     }
   }
 

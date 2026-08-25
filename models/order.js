@@ -9,9 +9,21 @@ module.exports = (sequelize, DataTypes) => {
         foreignKey: "customerId",
         as:         "customer",
       });
+      Order.belongsTo(models.User, {
+        foreignKey: "userId",
+        as:         "user",
+      });
       Order.hasMany(models.OrderDetail, {
         foreignKey: "orderId",
         as:         "orderDetails",
+      });
+      Order.hasMany(models.Payment, {
+        foreignKey: "orderId",
+        as:         "payments",
+      });
+      Order.hasMany(models.Return, {
+        foreignKey: "orderId",
+        as:         "returns",
       });
     }
   }
@@ -74,6 +86,10 @@ module.exports = (sequelize, DataTypes) => {
       },
       cancelReason: {
         type:      DataTypes.STRING,
+        allowNull: true,
+      },
+      userId: {
+        type:      DataTypes.INTEGER,
         allowNull: true,
       },
     },

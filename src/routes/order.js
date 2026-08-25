@@ -1,8 +1,9 @@
 const express = require("express");
-const { Order, Customer, OrderDetail, Product } = require("../../models");
+const { Order, Customer, OrderDetail, Product, Payment, User, Return, OrderDetailBatch } = require("../../models");
 const { sendTelegramMessage, formatOrderMessage } = require("../utils/telegram");
 const { sequelize } = require("../../models");
-const { deductStockFifo, restoreStockToBatch, isExpired } = require("../utils/batchStock");
+const { deductStockFifo, restoreStockToBatch, isExpired, allocateBatchesToOrderDetail, processReturn } = require("../utils/batchStock");
+const { Op } = require("sequelize");
 
 const router = express.Router();
 
@@ -85,6 +86,7 @@ router.post("/", async (req, res) => {
     const createdOrder = await Order.create(
       {
         customerId: null,
+        userId:     req.user ? req.user.id : null,
         orderNumber,
         total:     Number(total.toFixed(2)),
         discount:  Number(totalDiscount.toFixed(2)),
@@ -158,7 +160,10 @@ router.post("/:id/confirm", async (req, res) => {
       return res.status(400).json({ success: false, message: "Order already completed" });
     }
 
-    //  Deduct stock only after payment confirmed
+    //  Deduct stock only after payment confirmed.
+    //  allocateBatchesToOrderDetail handles FIFO selection, OrderDetailBatch
+    //  creation, ProductBatch.qty reduction, Inventory update, and SALE
+    //  movement creation — all inside this transaction.
     for (const detail of order.orderDetails) {
       const product = await Product.findByPk(detail.productId, { transaction });
 
@@ -177,16 +182,12 @@ router.post("/:id/confirm", async (req, res) => {
         });
       }
 
-      if (product.qty < detail.qty) {
-        await transaction.rollback();
-        return res.status(400).json({
-          success: false,
-          message: `Stock  "${product.name}"  payment`,
-        });
-      }
-
-      // Deduct FIFO (soonest-expiring batch first)
-      await deductStockFifo(detail.productId, detail.qty, { transaction });
+      // Allocate batches (FIFO), create OrderDetailBatches, reduce stock,
+      // update Inventory, and create SALE movements — atomically.
+      await allocateBatchesToOrderDetail(detail.id, detail.productId, detail.qty, {
+        userId: req.user ? req.user.id : null,
+        transaction,
+      });
     }
 
     await order.update({ status: "completed" }, { transaction });
@@ -251,11 +252,9 @@ router.patch("/:id/cancel", async (req, res) => {
     //  Only restore stock if order was completed (stock was deducted)
     if (order.status === "completed") {
       for (const detail of order.orderDetails) {
-        const product = await Product.findByPk(detail.productId, { transaction });
-        if (product) {
-          // Return to the batch FIFO would have deducted next (or a new batch)
-          await restoreStockToBatch(detail.productId, detail.qty, { transaction });
-        }
+        // processReturn restores to the original batch(es) via OrderDetailBatch
+        // records, updates Inventory, and creates RETURN movements.
+        await processReturn(detail.id, detail.productId, detail.qty, { transaction });
       }
     }
     await order.update(
@@ -282,20 +281,229 @@ router.patch("/:id/cancel", async (req, res) => {
   }
 });
 
-// ─── GET: All Orders ──────────────────────────────────────
+// ─── POST: Return items from a completed order ─────────────
+// Body: { orderDetailId, qty }
+// Restores stock to the original batch(es) and creates RETURN movements.
+router.post("/:id/return", async (req, res) => {
+  const transaction = await sequelize.transaction();
+
+  try {
+    const { id } = req.params;
+    const { orderDetailId, qty } = req.body;
+
+    if (!orderDetailId || !qty || Number(qty) <= 0) {
+      await transaction.rollback();
+      return res.status(400).json({
+        success: false,
+        message: "orderDetailId and positive qty are required",
+      });
+    }
+
+    const order = await Order.findByPk(id, {
+      include: [{ model: OrderDetail, as: "orderDetails" }],
+      transaction,
+    });
+
+    if (!order) {
+      await transaction.rollback();
+      return res.status(404).json({ success: false, message: `Order id=${id} not found` });
+    }
+
+    if (order.status !== "completed") {
+      await transaction.rollback();
+      return res.status(400).json({
+        success: false,
+        message: "Only completed orders can be returned",
+      });
+    }
+
+    // Verify the orderDetail belongs to this order
+    const detail = order.orderDetails.find((d) => d.id === Number(orderDetailId));
+    if (!detail) {
+      await transaction.rollback();
+      return res.status(404).json({
+        success: false,
+        message: `Order detail id=${orderDetailId} not found in this order`,
+      });
+    }
+
+    const returnQty = Number(qty);
+    if (returnQty > detail.qty) {
+      await transaction.rollback();
+      return res.status(400).json({
+        success: false,
+        message: `Return qty (${returnQty}) exceeds ordered qty (${detail.qty})`,
+      });
+    }
+
+    // Process the return: restore stock, update Inventory, create movements
+    const movements = await processReturn(detail.id, detail.productId, returnQty, {
+      userId: req.user ? req.user.id : null,
+      transaction,
+    });
+
+    // Resolve the batch used for this order detail (for Return record)
+    const firstBatch = await OrderDetailBatch.findOne({
+      where: { orderDetailId: detail.id },
+      transaction,
+    });
+
+    // Create a Return DB record for Sale History traceability
+    const unitRefund = detail.qty > 0 ? Number(detail.amount) / detail.qty : 0;
+    const returnRecord = await Return.create({
+      orderId:        order.id,
+      orderDetailId:  detail.id,
+      productId:      detail.productId,
+      batchId:        firstBatch ? firstBatch.batchId : null,
+      quantity:       returnQty,
+      refundAmount:   Number((unitRefund * returnQty).toFixed(2)),
+      reason:         req.body.reason || null,
+      refundMethod:   req.body.refundMethod || "Cash",
+      status:         "COMPLETED",
+      processedBy:    req.user ? req.user.id : null,
+    }, { transaction });
+
+    await transaction.commit();
+
+    res.json({
+      success: true,
+      message: `Returned ${returnQty} unit(s) of "${detail.productName}"`,
+      data: {
+        orderId: order.id,
+        orderNumber: order.orderNumber,
+        orderDetailId: detail.id,
+        productName: detail.productName,
+        returnedQty: returnQty,
+        refundAmount: returnRecord.refundAmount,
+        movements: movements.length,
+        returnRecord: returnRecord,
+      },
+    });
+  } catch (error) {
+    await transaction.rollback();
+    console.error("Return order error:", error);
+    res.status(500).json({ success: false, message: "Internal server error" });
+  }
+});
+
+// ─── GET: All Orders (with filters) ───────────────────────
 router.get("/", async (req, res) => {
   try {
-    const { page = 1, limit = 10, search = "" } = req.query;
+    const {
+      page = 1,
+      limit = 10,
+      search = "",
+      dateFrom,
+      dateTo,
+      userId,
+      status,
+      paymentMethod,
+    } = req.query;
     const offset = (Number(page) - 1) * Number(limit);
 
+    const where = {};
+
+    // Date range filter
+    if (dateFrom || dateTo) {
+      where.createdAt = {};
+      if (dateFrom) where.createdAt[Op.gte] = new Date(`${dateFrom}T00:00:00.000Z`);
+      if (dateTo)   where.createdAt[Op.lte] = new Date(`${dateTo}T23:59:59.999Z`);
+    }
+
+    // Cashier filter
+    if (userId) where.userId = Number(userId);
+
+    // Order status filter
+    if (status && ["pending", "completed", "cancelled"].includes(status)) {
+      where.status = status;
+    }
+
+    // Search: order number
+    if (search && search.trim()) {
+      const term = `%${search.trim()}%`;
+      where[Op.or] = [{ orderNumber: { [Op.iLike]: term } }];
+    }
+
+    // Payment method filter (requires subquery since it lives on Payment)
+    let paymentMethodOrderIds = null;
+    if (paymentMethod) {
+      const paymentRows = await Payment.findAll({
+        where: { method: { [Op.iLike]: paymentMethod } },
+        attributes: ["orderId"],
+        raw: true,
+      });
+      paymentMethodOrderIds = paymentRows.map((p) => p.orderId);
+    }
+
     const { count, rows } = await Order.findAndCountAll({
-      include: [{ model: OrderDetail, as: "orderDetails" }],
-      order:  [["createdAt", "DESC"]],
+      where,
+      include: [
+        {
+          model: OrderDetail,
+          as: "orderDetails",
+          include: [
+            {
+              model: Product,
+              as: "product",
+              attributes: ["id", "name", "sku", "price", "barcode"],
+            },
+            {
+              model: OrderDetailBatch,
+              as: "orderDetailBatches",
+              include: [
+                {
+                  model: ProductBatch,
+                  as: "productBatch",
+                  attributes: ["id", "batchNumber", "expireDate"],
+                },
+              ],
+            },
+          ],
+        },
+        {
+          model: Payment,
+          as: "payments",
+          required: false,
+          separate: true,
+          limit: 1,
+          order: [["createdAt", "DESC"]],
+        },
+        {
+          model: User,
+          as: "user",
+          attributes: ["id", "firstName", "lastName", "email", "role"],
+          required: false,
+        },
+        {
+          model: Return,
+          as: "returns",
+          required: false,
+          separate: true,
+        },
+      ],
+      order: [["createdAt", "DESC"]],
       limit:  Number(limit),
       offset,
     });
 
-    res.json({ success: true, data: rows, total: count, page: Number(page), limit: Number(limit) });
+    // Post-filter by payment method if needed (avoids INNER JOIN exclusion)
+    let data = rows;
+    if (paymentMethodOrderIds !== null) {
+      if (paymentMethodOrderIds.length === 0) {
+        data = [];
+      } else {
+        data = rows.filter((o) => paymentMethodOrderIds.includes(o.id));
+      }
+    }
+
+    res.json({
+      success: true,
+      data,
+      total: count,
+      page: Number(page),
+      limit: Number(limit),
+      totalPages: Math.ceil(count / limit),
+    });
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });
   }
@@ -305,7 +513,50 @@ router.get("/", async (req, res) => {
 router.get("/:id", async (req, res) => {
   try {
     const order = await Order.findByPk(req.params.id, {
-      include: [{ model: OrderDetail, as: "orderDetails" }],
+      include: [
+        {
+          model: OrderDetail,
+          as: "orderDetails",
+          include: [
+            {
+              model: Product,
+              as: "product",
+              attributes: ["id", "name", "sku", "price", "barcode"],
+            },
+            {
+              model: OrderDetailBatch,
+              as: "orderDetailBatches",
+              include: [
+                {
+                  model: ProductBatch,
+                  as: "productBatch",
+                  attributes: ["id", "batchNumber", "expireDate"],
+                },
+              ],
+            },
+          ],
+        },
+        {
+          model: Payment,
+          as: "payments",
+          required: false,
+          separate: true,
+          limit: 1,
+          order: [["createdAt", "DESC"]],
+        },
+        {
+          model: User,
+          as: "user",
+          attributes: ["id", "firstName", "lastName", "email", "role"],
+          required: false,
+        },
+        {
+          model: Return,
+          as: "returns",
+          required: false,
+          separate: true,
+        },
+      ],
     });
     if (!order) return res.status(404).json({ success: false, message: "Order not found" });
     res.json({ success: true, data: order });

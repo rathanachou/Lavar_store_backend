@@ -4,7 +4,7 @@ const { sequelize } = require("../../models");
 const axios = require("axios");
 const { sendTelegramMessage, formatOrderMessage } = require("../utils/telegram");
 const { buildPurchaseHash, encodeBase64, getReqTime, buildCheckTransactionHash } = require("../utils/payway");
-const { deductStockFifo, isExpired } = require("../utils/batchStock");
+const { isExpired, allocateBatchesToOrderDetail } = require("../utils/batchStock");
 
 const router = app.Router();
 
@@ -208,19 +208,16 @@ async function confirmOrder(orderId) {
       return;
     }
 
-    //  Deduct stock now
+    //  Deduct stock now — allocateBatchesToOrderDetail handles FIFO selection,
+    //  OrderDetailBatch creation, Inventory update, and SALE movement creation.
     for (const detail of order.orderDetails) {
       const product = await Product.findByPk(detail.productId, { transaction });
       if (!product) throw new Error(`Product id=${detail.productId} not found`);
-      //  Block expired products before deducting stock — checked live against the
-      //  soonest qty>0 batch so a product that expired after order creation can't
-      //  complete. Throwing rolls back the whole confirm.
       if (await isExpired(detail.productId, { transaction })) {
         throw new Error(`Product "${product.name}" is expired and cannot be sold`);
       }
       if (product.qty < detail.qty) throw new Error(`Stock មិនគ្រប់ "${product.name}"`);
-      // Deduct FIFO (soonest-expiring batch first)
-      await deductStockFifo(detail.productId, detail.qty, { transaction });
+      await allocateBatchesToOrderDetail(detail.id, detail.productId, detail.qty, { transaction });
     }
 
     await order.update({ status: "completed" }, { transaction });

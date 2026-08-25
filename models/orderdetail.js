@@ -7,6 +7,18 @@ module.exports = (sequelize, DataTypes) => {
         foreignKey: "orderId",
         as: "order",
       });
+      OrderDetail.belongsTo(models.Product, {
+        foreignKey: "productId",
+        as: "product",
+      });
+      OrderDetail.hasMany(models.OrderDetailBatch, {
+        foreignKey: "orderDetailId",
+        as: "orderDetailBatches",
+      });
+      OrderDetail.hasMany(models.Return, {
+        foreignKey: "orderDetailId",
+        as: "returns",
+      });
     }
   }
 
