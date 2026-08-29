@@ -1,6 +1,8 @@
+const dayjs = require("dayjs");
+
 const express = require("express");
 const router = express.Router();
-const { Order, OrderDetail, Product, Customer } = require("../../models");
+const { Order, OrderDetail, Product, ProductBatch, Customer } = require("../../models");
 const { Op, fn, col, QueryTypes } = require("sequelize");
 
 // ─── TOP PRODUCTS ─────────────────────────────────────────
@@ -20,7 +22,7 @@ router.get("/top-products", async (req, res) => {
       raw: true,
     });
 
-    const parsed = topProducts.map(p => ({
+    const parsed = (Array.isArray(topProducts) ? topProducts : [topProducts].filter(Boolean)).map(p => ({
       ...p,
       totalQty: Number(p.totalQty) || 0,
       totalAmount: Number(p.totalAmount) || 0,
@@ -45,8 +47,18 @@ router.get("/summary", async (req, res) => {
     weekStart.setHours(0, 0, 0, 0);
     const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
 
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    const sevenDaysLater = new Date(today);
+    sevenDaysLater.setDate(sevenDaysLater.getDate() + 7);
+    sevenDaysLater.setHours(23, 59, 59, 999);
+    const thirtyDaysAgo = new Date(today);
+    thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
+    thirtyDaysAgo.setHours(0, 0, 0, 0);
+
     const [todayData, weeklyData, monthlyData,
-           totalProducts, totalCustomers, lowStock, topProducts] =
+           totalProducts, totalCustomers, lowStock, topProducts,
+           nearExpiryCount, oldStockCount] =
       await Promise.all([
         Order.findOne({
           attributes: [
@@ -80,6 +92,18 @@ router.get("/summary", async (req, res) => {
           order: [["qty", "ASC"]],
           limit: 10,
         }),
+        ProductBatch.count({
+          where: {
+            qty: { [Op.gt]: 0 },
+            expireDate: { [Op.ne]: null, [Op.between]: [today, sevenDaysLater] },
+          },
+        }),
+        ProductBatch.count({
+          where: {
+            qty: { [Op.gt]: 0 },
+            receivedDate: { [Op.lte]: thirtyDaysAgo },
+          },
+        }),
         OrderDetail.findAll({
           attributes: [
             "productName",
@@ -111,7 +135,9 @@ router.get("/summary", async (req, res) => {
         totalProducts,
         totalCustomers,
         lowStock,
-        topProducts: topProducts.map(p => ({
+        nearExpiryCount,
+        oldStockCount,
+        topProducts: (Array.isArray(topProducts) ? topProducts : [topProducts].filter(Boolean)).map(p => ({
           ...p,
           totalQty: Number(p.totalQty) || 0,
           totalAmount: Number(p.totalAmount) || 0,
@@ -127,7 +153,11 @@ router.get("/summary", async (req, res) => {
 router.get("/sales/daily", async (req, res) => {
   try {
     const sequelize = Order.sequelize;
-    const date = req.query.date || new Date().toISOString().split("T")[0];
+    // Cashiers may only view today's report — ignore any date they send.
+    const isCashier = req.user?.role === "cashier";
+    const date = isCashier
+      ? dayjs().format("YYYY-MM-DD")
+      : (req.query.date || dayjs().format("YYYY-MM-DD"));
 
     const data = await sequelize.query(
       `SELECT

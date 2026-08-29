@@ -11,18 +11,34 @@ router.get("/", async (req, res) => {
     const limit  = Number(req.query.limit) || 20;
     const offset = (page - 1) * limit;
 
+    const productWhere = {};
+    if (req.query.search) {
+      const search = req.query.search.replace(/\s+/g, "").toLowerCase();
+      productWhere.name = { [Op.like]: `%${search}%` };
+    }
+    if (req.query.categoryId) {
+      productWhere.categoryId = Number(req.query.categoryId);
+    }
+    if (req.query.isActive !== undefined) {
+      productWhere.isActive = req.query.isActive === "true";
+    }
+    if (req.query.inStock === "true") {
+      productWhere.qty = { [Op.gt]: 0 };
+    } else if (req.query.inStock === "false") {
+      productWhere.qty = { [Op.lte]: 0 };
+    }
+
     const { count, rows } = await Inventory.findAndCountAll({
       include: [
         {
+          model: Product,
+          as: "product",
+          where: Object.keys(productWhere).length > 0 ? productWhere : undefined,
+          include: [{ model: Category, as: "category", attributes: ["id", "name"] }],
+        },
+        {
           model: ProductBatch,
           as: "productBatch",
-          include: [
-            {
-              model: Product,
-              as: "product",
-              include: [{ model: Category, as: "category", attributes: ["id", "name"] }],
-            },
-          ],
         },
       ],
       order: [["updatedAt", "DESC"]],
