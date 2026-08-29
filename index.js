@@ -62,6 +62,36 @@ db.sequelize
   .then(async () => {
     console.log("Database connected successfully");
 
+    // ── Migration drift check (informational only, never blocks startup) ──
+    // Compares the migrations folder against SequelizeMeta and logs a loud
+    // warning if any migration files have not yet been run against this DB.
+    try {
+      const fs = require("fs");
+      const path = require("path");
+      const migrationsDir = path.join(__dirname, "migrations");
+      const migrationFiles = fs.readdirSync(migrationsDir)
+        .filter((f) => f.endsWith(".js"))
+        .sort();
+
+      const [appliedRows] = await db.sequelize.query(
+        'SELECT name FROM "SequelizeMeta" ORDER BY name'
+      );
+      const applied = new Set(appliedRows.map((r) => r.name));
+
+      const pending = migrationFiles.filter((f) => !applied.has(f));
+      if (pending.length > 0) {
+        console.warn(
+          `\n⚠️⚠️⚠️ PENDING MIGRATIONS DETECTED ⚠️⚠️⚠️\n` +
+          `The following ${pending.length} migration(s) have NOT been applied to this database:\n` +
+          pending.map((f) => `  - ${f}`).join("\n") +
+          `\nRun: npx sequelize-cli db:migrate --env production\n`
+        );
+      }
+    } catch (err) {
+      // Never block startup for a schema check — just log it.
+      console.error("Migration check failed:", err.message);
+    }
+
     // Run automated expiry sweep on startup (catches anything that
     // expired while the server was down). The sweep is idempotent —
     // already-processed batches are skipped.
