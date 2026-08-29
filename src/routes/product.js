@@ -4,7 +4,7 @@ const path = require("path");
 const { Product, ProductImage, ProductBatch, Category, sequelize } = require("../../models");
 const { Op, fn, col, where } = require("sequelize");
 const generateBarcodePDF = require('../utils/generateBarcodePDF');
-const { addStockToBatch, deductStockFifo, syncProductFromBatches, createStockMovement, updateInventoryForBatch, ensureInventoryForBatch } = require('../utils/batchStock');
+const { addStockToBatch, deductStockFifo, syncProductFromBatches, createStockMovement, updateInventoryForBatch, ensureInventoryForBatch, isExpired } = require('../utils/batchStock');
 const { authenticate, authorizeRoles } = require("../middlewares/authMiddleware");
 const router = express.Router();
 const { storage, cloudinary } = require('../storage/storage')
@@ -39,10 +39,16 @@ router.get("/", async (req, res) => {
       conditions.push({ categoryId: req.query.categoryId });
     }
 
-    if (req.query.inStock === "false") {
+    if (req.query.inStock === "true") {
+      conditions.push({ qty: { [Op.gt]: 0 } });
+    } else if (req.query.inStock === "false") {
       conditions.push({ qty: { [Op.lte]: 0 } });
     } else if (req.query.maxQty !== undefined) {
       conditions.push({ qty: { [Op.lte]: Number(req.query.maxQty) } });
+    }
+
+    if (req.query.isActive !== undefined) {
+      conditions.push({ isActive: req.query.isActive === "true" });
     }
 
     const whereCondition = conditions.length > 0
@@ -91,7 +97,7 @@ router.get("/", async (req, res) => {
 });
 
 // ─── GET: Low Stock ───────────────────────────────────────
-router.get("/stock/low", async (req, res) => {
+router.get("/stock/low", authenticate, async (req, res) => {
   try {
     const threshold = Number(req.query.threshold) || 10;
 
@@ -125,7 +131,7 @@ router.get("/stock/low", async (req, res) => {
 // Returns individual ProductBatch rows whose expire_date is within `days`
 // from today (default 20), sorted by expire_date ascending, joined with the
 // product (name/sku/price/discount). Includes already-discounted products too.
-router.get("/near-expiry", async (req, res) => {
+router.get("/near-expiry", authenticate, async (req, res) => {
   try {
     const days = Math.max(1, Number(req.query.days) || 20);
 
@@ -180,7 +186,7 @@ router.get("/near-expiry", async (req, res) => {
 });
 
 // ─── GET: Lookup product by barcode — fast O(1) DB lookup ────
-router.get("/barcode/:code", async (req, res) => {
+router.get("/barcode/:code", authenticate, async (req, res) => {
   try {
     const { code } = req.params;
     const product = await Product.findOne({
@@ -202,10 +208,18 @@ router.get("/barcode/:code", async (req, res) => {
       });
     }
 
+    const qty = Number(product.qty) || 0;
+    const expired = await isExpired(product.id);
+
     res.json({
       success: true,
       message: "Product found by barcode",
-      data: product,
+      data: {
+        ...product.toJSON(),
+        isExpired:     expired,
+        isOutOfStock:  qty <= 0,
+        isInactive:    !product.isActive,
+      },
     });
   } catch (error) {
     console.error("Barcode lookup error:", error);
@@ -281,11 +295,11 @@ router.post('/barcodes/print', authenticate, authorizeRoles('admin'), async (req
   }
 });
 
-// ─── POST: Add Product Batch (admin/cashier) ─────────────
+// ─── POST: Add Product Batch (admin only) ─────────────────
 // Body: { qty, expire_date?, batch_number?, cost_price? }
 // Adds received stock as a new batch instead of just bumping Product.qty.
 // Also creates Inventory row and PURCHASE stock movement.
-router.post("/:id/batches", async (req, res) => {
+router.post("/:id/batches", authenticate, authorizeRoles("admin"), async (req, res) => {
   const transaction = await sequelize.transaction();
   try {
     const { id } = req.params;
@@ -351,7 +365,7 @@ router.post("/:id/batches", async (req, res) => {
 
 // ─── GET: List Product Batches ───────────────────────────
 // Ordered by expire_date ASC (soonest-expiring first), no-expiry last.
-router.get("/:id/batches", async (req, res) => {
+router.get("/:id/batches", authenticate, async (req, res) => {
   try {
     const { id } = req.params;
 
@@ -434,7 +448,7 @@ router.delete("/batches/:batchId", authenticate, authorizeRoles("admin"), async 
 });
 
 // ─── GET: Stock Info ──────────────────────────────────────
-router.get("/:id/stock", async (req, res) => {
+router.get("/:id/stock", authenticate, async (req, res) => {
   try {
     const { id } = req.params;
     const product = await Product.findByPk(id, {
@@ -465,7 +479,7 @@ router.get("/:id/stock", async (req, res) => {
 });
 
 // ─── GET: Single Barcode PDF ──────────────────────────────
-router.get('/:id/barcode/print', async (req, res) => {
+router.get('/:id/barcode/print', authenticate, authorizeRoles('admin'), async (req, res) => {
   try {
     const product = await Product.findByPk(req.params.id, {
       attributes: ['id', 'name', 'price'],
@@ -711,95 +725,93 @@ router.put("/:id", authenticate, authorizeRoles("admin"), async (req, res) => {
       expireDate: nextExpireDate,
     }, { transaction });
 
-    // Reconcile the denormalized Product.qty field against the batch table.
-    // Batches are the source of truth; if the form's qty differs from the sum
-    // of batch quantities, add or deduct the difference so the invariant holds.
-    const requestedQty = Number(qty) || 0;
-    const batches = await ProductBatch.findAll({ where: { productId: id }, transaction });
-    const sumQty = batches.reduce((s, b) => s + Number(b.qty), 0);
-    const delta = requestedQty - sumQty;
+    // Reconcile the denormalized Product.qty field against the batch table
+    // ONLY when the caller explicitly sent a qty value. If qty is absent from
+    // the request body (e.g. admin is editing name/price only), we must NOT
+    // touch batch stock — Number(undefined) would become 0 and zero every batch.
+    const qtyFieldProvided = Object.prototype.hasOwnProperty.call(req.body, "qty");
 
-    if (delta > 0) {
-      const batch = await addStockToBatch(id, { qty: delta, expireDate: nextExpireDate }, { transaction });
-      // Initialize Inventory and create PURCHASE movement for the new batch stock
-      await ensureInventoryForBatch(batch.id, { transaction });
-      await updateInventoryForBatch(batch.id, delta, 0, { transaction });
-      await createStockMovement(
-        id,
-        batch.id,
-        "PURCHASE",
-        delta,
-        {
-          userId: req.user ? req.user.id : null,
-          referenceId: `update:product:${id}`,
-          reason:      "Product qty update (increase)",
-          transaction,
-        }
-      );
-      // A form-set expireDate must win over any older batch expiry, so stamp
-      // every qty>0 batch with it; otherwise the sync below prefers the
-      // soonest existing batch and the saved value would be clobbered.
-      if (expireFieldProvided && nextExpireDate) {
-        await ProductBatch.update(
-          { expireDate: nextExpireDate },
-          { where: { productId: id, qty: { [Op.gt]: 0 } }, transaction }
-        );
-      }
-      await syncProductFromBatches(id, { transaction });
-    } else if (delta < 0) {
-      const absDelta = Math.abs(delta);
-      // Replicate FIFO deduction with per-batch tracking
-      const batchRows = await ProductBatch.findAll({
-        where: { productId: id, qty: { [Op.gt]: 0 } },
-        order: [["expireDate", "ASC NULLS LAST"]],
-        transaction,
-      });
+    if (qtyFieldProvided) {
+      const requestedQty = Number(qty) || 0;
+      const batches = await ProductBatch.findAll({ where: { productId: id }, transaction });
+      const sumQty = batches.reduce((s, b) => s + Number(b.qty), 0);
+      const delta = requestedQty - sumQty;
 
-      let remaining = absDelta;
-      for (const batch of batchRows) {
-        if (remaining <= 0) break;
-        const take = Math.min(Number(batch.qty), remaining);
-        await batch.update({ qty: Number(batch.qty) - take }, { transaction });
-        await updateInventoryForBatch(batch.id, -take, 0, { transaction });
+      if (delta > 0) {
+        const batch = await addStockToBatch(id, { qty: delta, expireDate: nextExpireDate }, { transaction });
+        await ensureInventoryForBatch(batch.id, { transaction });
+        await updateInventoryForBatch(batch.id, delta, 0, { transaction });
         await createStockMovement(
-          id,
-          batch.id,
-          "ADJUSTMENT",
-          -take,
+          id, batch.id, "PURCHASE", delta,
           {
             userId: req.user ? req.user.id : null,
             referenceId: `update:product:${id}`,
-            reason:      "Product qty update (decrease)",
+            reason: "Product qty update (increase)",
             transaction,
           }
         );
-        remaining -= take;
-      }
+        if (expireFieldProvided && nextExpireDate) {
+          await ProductBatch.update(
+            { expireDate: nextExpireDate },
+            { where: { productId: id, qty: { [Op.gt]: 0 } }, transaction }
+          );
+        }
+        await syncProductFromBatches(id, { transaction });
+      } else if (delta < 0) {
+        const absDelta = Math.abs(delta);
+        const batchRows = await ProductBatch.findAll({
+          where: { productId: id, qty: { [Op.gt]: 0 } },
+          order: [["expireDate", "ASC NULLS LAST"]],
+          transaction,
+        });
 
-      if (remaining > 0) {
-        throw new Error(`Insufficient stock for product id=${id} during update`);
-      }
+        let remaining = absDelta;
+        for (const batch of batchRows) {
+          if (remaining <= 0) break;
+          const take = Math.min(Number(batch.qty), remaining);
+          await batch.update({ qty: Number(batch.qty) - take }, { transaction });
+          await updateInventoryForBatch(batch.id, -take, 0, { transaction });
+          await createStockMovement(
+            id, batch.id, "ADJUSTMENT", -take,
+            {
+              userId: req.user ? req.user.id : null,
+              referenceId: `update:product:${id}`,
+              reason: "Product qty update (decrease)",
+              transaction,
+            }
+          );
+          remaining -= take;
+        }
 
-      // Same batch reconciliation as the other branches so a form-set or
-      // form-cleared expireDate survives even when stock was deducted.
-      if (expireFieldProvided) {
-        await ProductBatch.update(
-          { expireDate: nextExpireDate },
-          { where: { productId: id, qty: { [Op.gt]: 0 } }, transaction }
-        );
+        if (remaining > 0) {
+          throw new Error(`Insufficient stock for product id=${id} during update`);
+        }
+
+        if (expireFieldProvided) {
+          await ProductBatch.update(
+            { expireDate: nextExpireDate },
+            { where: { productId: id, qty: { [Op.gt]: 0 } }, transaction }
+          );
+        }
+        await syncProductFromBatches(id, { transaction });
+      } else {
+        // qty matches — just reconcile expire_date cache if the form sent it.
+        if (expireFieldProvided) {
+          await ProductBatch.update(
+            { expireDate: nextExpireDate },
+            { where: { productId: id, qty: { [Op.gt]: 0 } }, transaction }
+          );
+        }
+        await syncProductFromBatches(id, { transaction });
       }
-      await syncProductFromBatches(id, { transaction });
     } else {
-      // qty already matches — reconcile the batch that drives the expire_date
-      // cache so the form value (set or cleared) survives the sync below
-      // instead of being clobbered by syncProductFromBatches.
+      // qty not provided — only reconcile expire_date cache if the form sent it.
       if (expireFieldProvided) {
         await ProductBatch.update(
           { expireDate: nextExpireDate },
           { where: { productId: id, qty: { [Op.gt]: 0 } }, transaction }
         );
       }
-      // Refresh expire_date cache from batches (sooner batch wins).
       await syncProductFromBatches(id, { transaction });
     }
 
@@ -928,11 +940,22 @@ router.patch("/:id/stock/out", authenticate, authorizeRoles("admin"), async (req
     const outQty = Number(qty);
 
     // Deduct FIFO (soonest-expiring batch first) — batches are the source of truth.
+    // Skip expired batches (expireDate < today) so stock-out never touches them.
     // We replicate the FIFO logic here so we can track which batches were affected
     // and create per-batch ADJUSTMENT movements + inventory updates.
     const { Op } = require("sequelize");
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    const todayStr = today.toISOString().slice(0, 10);
     const batches = await ProductBatch.findAll({
-      where: { productId: id, qty: { [Op.gt]: 0 } },
+      where: {
+        productId: id,
+        qty: { [Op.gt]: 0 },
+        [Op.or]: [
+          { expireDate: null },
+          { expireDate: { [Op.gte]: todayStr } },
+        ],
+      },
       order: [["expireDate", "ASC NULLS LAST"]],
       transaction,
     });

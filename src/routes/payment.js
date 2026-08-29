@@ -1,15 +1,24 @@
 const app = require("express");
-const { Payment, Customer, Order, OrderDetail, Product } = require("../../models");
+const { Payment, Customer, Order, OrderDetail, Product, User } = require("../../models");
 const { sequelize } = require("../../models");
 const axios = require("axios");
 const { sendTelegramMessage, formatOrderMessage } = require("../utils/telegram");
 const { buildPurchaseHash, encodeBase64, getReqTime, buildCheckTransactionHash } = require("../utils/payway");
 const { isExpired, allocateBatchesToOrderDetail } = require("../utils/batchStock");
+const { authenticate } = require("../middlewares/authMiddleware");
 
 const router = app.Router();
 
+// ─── POST: Payment Gateway Callback (public — webhook) ────
+// Mounted at /api/v1/payments/callback in index.js.
+// Exists so the router has a root handler; without it, POST /callback
+// falls through to POST /:orderId below (orderId = "callback").
+router.post("/", async (req, res) => {
+  res.status(501).json({ message: "Callback received — use POST /:tranId/check for transaction status" });
+});
+
 // ─── POST: Create Payment ─────────────────────────────────
-router.post("/:orderId", async (req, res) => {
+router.post("/:orderId", authenticate, async (req, res) => {
   const { orderId } = req.params;
   try {
     const order = await Order.findByPk(orderId, {
@@ -208,6 +217,15 @@ async function confirmOrder(orderId) {
       return;
     }
 
+    //  Resolve the cashier from the original order so the ABA callback
+    //  (which has no logged-in user) can attribute the SALE movements.
+    const cashierUser = order.userId
+      ? await User.findByPk(order.userId, { attributes: ["id", "firstName", "lastName"], transaction })
+      : null;
+    const cashierName = cashierUser
+      ? (cashierUser.firstName + " " + cashierUser.lastName).trim()
+      : "Online Order";
+
     //  Deduct stock now — allocateBatchesToOrderDetail handles FIFO selection,
     //  OrderDetailBatch creation, Inventory update, and SALE movement creation.
     for (const detail of order.orderDetails) {
@@ -217,15 +235,16 @@ async function confirmOrder(orderId) {
         throw new Error(`Product "${product.name}" is expired and cannot be sold`);
       }
       if (product.qty < detail.qty) throw new Error(`Stock មិនគ្រប់ "${product.name}"`);
-      await allocateBatchesToOrderDetail(detail.id, detail.productId, detail.qty, { transaction });
+      await allocateBatchesToOrderDetail(detail.id, detail.productId, detail.qty, {
+        userId: order.userId,
+        transaction,
+      });
     }
 
     await order.update({ status: "completed" }, { transaction });
     await transaction.commit();
 
     //  Fire Telegram notification (non-blocking — no await)
-    const cashierName = 'Walk-in Customer';
-
     sendTelegramMessage(formatOrderMessage({
       orderNumber: order.orderNumber,
       total:       Number(order.total).toFixed(2),

@@ -33,7 +33,7 @@ const authorizeRoles = (...roles) => {
       });
     }
 
-    const hasRole = roles.includes(req.user.role);
+    const hasRole = roles.some((r) => r.toLowerCase() === (req.user.role || "").toLowerCase());
 
     if (!hasRole) {
       return res.status(403).json({

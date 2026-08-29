@@ -1,9 +1,10 @@
 const express = require("express");
 
 const { Customer } = require("../../models");
+const { authenticate } = require("../middlewares/authMiddleware");
 const router = express.Router();
 
-router.get("", async (req, res) => {
+router.get("", authenticate, async (req, res) => {
   try {
     const customers = await Customer.findAll()
 
@@ -15,7 +16,7 @@ router.get("", async (req, res) => {
   }
 })
 
-router.post("", async (req, res) => {
+router.post("", authenticate, async (req, res) => {
   try {
     const customers = await Customer.findAll()
 

@@ -1,11 +1,12 @@
 const express = require("express");
 const { StockMovement, Product, ProductBatch, User, Category, sequelize } = require("../../models");
 const { Op } = require("sequelize");
+const { authenticate } = require("../middlewares/authMiddleware");
 
 const router = express.Router();
 
 // ─── GET: All Stock Movements ────────────────────────────
-router.get("/", async (req, res) => {
+router.get("/", authenticate, async (req, res) => {
   try {
     const page    = Number(req.query.page)    || 1;
     const limit   = Number(req.query.limit)   || 20;
@@ -60,7 +61,7 @@ router.get("/", async (req, res) => {
 });
 
 // ─── GET: Single Stock Movement ──────────────────────────
-router.get("/:id", async (req, res) => {
+router.get("/:id", authenticate, async (req, res) => {
   try {
     const movement = await StockMovement.findByPk(req.params.id, {
       include: [
@@ -82,7 +83,7 @@ router.get("/:id", async (req, res) => {
 });
 
 // ─── GET: Movements by Product ───────────────────────────
-router.get("/product/:productId", async (req, res) => {
+router.get("/product/:productId", authenticate, async (req, res) => {
   try {
     const { productId } = req.params;
     const page   = Number(req.query.page)  || 1;
@@ -122,7 +123,7 @@ router.get("/product/:productId", async (req, res) => {
 });
 
 // ─── GET: Movements by Batch ─────────────────────────────
-router.get("/batch/:batchId", async (req, res) => {
+router.get("/batch/:batchId", authenticate, async (req, res) => {
   try {
     const { batchId } = req.params;
     const page   = Number(req.query.page)  || 1;
@@ -162,7 +163,7 @@ router.get("/batch/:batchId", async (req, res) => {
 });
 
 // ─── GET: Movements by Type ──────────────────────────────
-router.get("/type/:type", async (req, res) => {
+router.get("/type/:type", authenticate, async (req, res) => {
   try {
     const { type } = req.params;
     const validTypes = ["PURCHASE", "SALE", "RETURN", "ADJUSTMENT", "DAMAGE", "EXPIRED"];
