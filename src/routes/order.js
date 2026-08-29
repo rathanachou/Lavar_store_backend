@@ -1,9 +1,11 @@
 const express = require("express");
-const { Order, Customer, OrderDetail, Product, Payment, User, Return, OrderDetailBatch } = require("../../models");
+const { Order, Customer, OrderDetail, Product, Payment, User, Return, OrderDetailBatch, ProductBatch } = require("../../models");
 const { sendTelegramMessage, formatOrderMessage } = require("../utils/telegram");
 const { sequelize } = require("../../models");
 const { deductStockFifo, restoreStockToBatch, isExpired, allocateBatchesToOrderDetail, processReturn } = require("../utils/batchStock");
 const { Op } = require("sequelize");
+const { authenticate } = require("../middlewares/authMiddleware");
+const requireRole = require("../middlewares/requireRole");
 
 const router = express.Router();
 
@@ -184,13 +186,50 @@ router.post("/:id/confirm", async (req, res) => {
 
       // Allocate batches (FIFO), create OrderDetailBatches, reduce stock,
       // update Inventory, and create SALE movements — atomically.
-      await allocateBatchesToOrderDetail(detail.id, detail.productId, detail.qty, {
-        userId: req.user ? req.user.id : null,
-        transaction,
-      });
+      try {
+        await allocateBatchesToOrderDetail(detail.id, detail.productId, detail.qty, {
+          userId: req.user ? req.user.id : null,
+          transaction,
+        });
+      } catch (err) {
+        await transaction.rollback();
+        const message = err.message || "Failed to allocate stock for this order";
+        // Map known allocation errors to clear 400 responses so the
+        // frontend can show the cashier a meaningful message.
+        if (
+          message.includes("No batches available") ||
+          message.includes("Insufficient stock") ||
+          message.includes("Stock")
+        ) {
+          return res.status(400).json({ success: false, message });
+        }
+        return res.status(500).json({ success: false, message: "Internal server error", details: message });
+      }
     }
 
     await order.update({ status: "completed" }, { transaction });
+
+    // Create a CASH Payment record if none exists for this order.
+    // ABA PayWay orders already have a Payment created by POST /:orderId
+    // in payment.js, so this guard prevents duplicates.
+    const existingPayment = await Payment.findOne({
+      where: { orderId: order.id },
+      transaction,
+    });
+    if (!existingPayment) {
+      await Payment.create(
+        {
+          orderId: order.id,
+          method: "CASH",
+          status: "PAID",
+          amount: Number(order.total),
+          remark: "Cash payment at confirm",
+          paidAt: new Date(),
+        },
+        { transaction }
+      );
+    }
+
     await transaction.commit();
 
     //  Fire Telegram notification after response is sent (non-blocking)
@@ -284,7 +323,7 @@ router.patch("/:id/cancel", async (req, res) => {
 // ─── POST: Return items from a completed order ─────────────
 // Body: { orderDetailId, qty }
 // Restores stock to the original batch(es) and creates RETURN movements.
-router.post("/:id/return", async (req, res) => {
+router.post("/:id/return", authenticate, requireRole("admin", "cashier"), async (req, res) => {
   const transaction = await sequelize.transaction();
 
   try {
@@ -328,11 +367,24 @@ router.post("/:id/return", async (req, res) => {
     }
 
     const returnQty = Number(qty);
-    if (returnQty > detail.qty) {
+
+    // Check already-completed returns for this line item to prevent duplicates
+    const existingReturns = await Return.findAll({
+      where: {
+        orderDetailId: detail.id,
+        status: "COMPLETED",
+      },
+      attributes: ["quantity"],
+      transaction,
+    });
+    const alreadyReturned = existingReturns.reduce((s, r) => s + Number(r.quantity || 0), 0);
+    const remainingReturnable = detail.qty - alreadyReturned;
+
+    if (returnQty > remainingReturnable) {
       await transaction.rollback();
       return res.status(400).json({
         success: false,
-        message: `Return qty (${returnQty}) exceeds ordered qty (${detail.qty})`,
+        message: `Cannot return ${returnQty} unit(s) — only ${remainingReturnable} unit(s) remain returnable for this item (${alreadyReturned}/${detail.qty} already returned)`,
       });
     }
 
@@ -479,6 +531,18 @@ router.get("/", async (req, res) => {
           as: "returns",
           required: false,
           separate: true,
+          include: [
+            {
+              model: User,
+              as: "processedByUser",
+              attributes: ["id", "firstName", "lastName", "email", "role"],
+            },
+            {
+              model: Product,
+              as: "product",
+              attributes: ["id", "name", "sku"],
+            },
+          ],
         },
       ],
       order: [["createdAt", "DESC"]],
@@ -496,9 +560,28 @@ router.get("/", async (req, res) => {
       }
     }
 
+    // Build returnedQty map from COMPLETED returns, then serialize
+    // each order explicitly so the computed field reaches the response.
+    const serialized = data.map((order) => {
+      const detailReturns = order.returns || [];
+      const returnedMap = {};
+      for (const r of detailReturns) {
+        if (r.status !== "COMPLETED") continue;
+        const key = r.orderDetailId;
+        returnedMap[key] = (returnedMap[key] || 0) + Number(r.quantity || 0);
+      }
+
+      const orderJson = order.toJSON();
+      orderJson.orderDetails = (orderJson.orderDetails || []).map((d) => ({
+        ...d,
+        returnedQty: returnedMap[d.id] || 0,
+      }));
+      return orderJson;
+    });
+
     res.json({
       success: true,
-      data,
+      data: serialized,
       total: count,
       page: Number(page),
       limit: Number(limit),
@@ -555,11 +638,39 @@ router.get("/:id", async (req, res) => {
           as: "returns",
           required: false,
           separate: true,
+          include: [
+            {
+              model: User,
+              as: "processedByUser",
+              attributes: ["id", "firstName", "lastName", "email", "role"],
+            },
+            {
+              model: Product,
+              as: "product",
+              attributes: ["id", "name", "sku"],
+            },
+          ],
         },
       ],
     });
     if (!order) return res.status(404).json({ success: false, message: "Order not found" });
-    res.json({ success: true, data: order });
+
+    // Build returnedQty map from COMPLETED returns, then serialize
+    // the order explicitly so the computed field reaches the response.
+    const detailReturns = order.returns || [];
+    const returnedMap = {};
+    for (const r of detailReturns) {
+      if (r.status !== "COMPLETED") continue;
+      const key = r.orderDetailId;
+      returnedMap[key] = (returnedMap[key] || 0) + Number(r.quantity || 0);
+    }
+
+    const orderJson = order.toJSON();
+    orderJson.orderDetails = (orderJson.orderDetails || []).map((d) => ({
+      ...d,
+      returnedQty: returnedMap[d.id] || 0,
+    }));
+    res.json({ success: true, data: orderJson });
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });
   }

@@ -1,9 +1,24 @@
 const express = require("express");
-const { Order, OrderDetail, Payment, sequelize } = require("../../models");
-const { Op, fn, col } = require("sequelize");
+const { Order, OrderDetail, Payment, Return, Product, ProductBatch, User, sequelize } = require("../../models");
+const { Op } = require("sequelize");
 const PDFDocument = require("pdfkit");
 const dayjs = require("dayjs");
+const path = require("path");
 const requireRole = require("../middlewares/requireRole");
+
+// Khmer-capable font for Riel symbol and any Khmer text.
+// PDFKit's built-in Helvetica/Times only support Latin-1 — U+17DB (៛)
+// renders as "Ů" without an explicit Khmer font.
+const KHMER_FONT = path.join(__dirname, "../assets/fonts/KhmerUI.ttf");
+const {
+  buildPaymentMap,
+  splitOrdersByStatus,
+  aggregateCompletedOrders,
+  aggregateCancelledOrders,
+  buildDailyBreakdown,
+  getPaymentMethod,
+  aggregateReturns,
+} = require("../utils/reportHelpers");
 
 const router = express.Router();
 
@@ -19,7 +34,7 @@ router.get("/daily-sales", async (req, res) => {
     const dayStart = new Date(`${date}T00:00:00.000Z`);
     const dayEnd   = new Date(`${date}T23:59:59.999Z`);
 
-    // ── Fetch all orders for the date (any status) ──────────
+    // ── Fetch all orders for the date (all statuses) ────────
     const orders = await Order.findAll({
       where: {
         createdAt: { [Op.between]: [dayStart, dayEnd] },
@@ -35,63 +50,47 @@ router.get("/daily-sales", async (req, res) => {
     const payments = orderIds.length > 0
       ? await Payment.findAll({ where: { orderId: orderIds } })
       : [];
+    const paymentMap = buildPaymentMap(payments);
 
-    // Build a payment map: orderId → payment
-    const paymentMap = {};
-    for (const p of payments) {
-      // For orders with multiple payments, keep only the first/primary
-      if (!paymentMap[p.orderId]) paymentMap[p.orderId] = p;
-    }
+    // ── Fetch returns for those orders (with processor info) ──
+    const returns = orderIds.length > 0
+      ? await Return.findAll({
+          where: { orderId: orderIds, status: { [Op.not]: "CANCELLED" } },
+          include: [
+            {
+              model: Order,
+              as: "order",
+              attributes: ["id", "orderNumber"],
+            },
+            {
+              model: Product,
+              as: "product",
+              attributes: ["id", "name"],
+            },
+            {
+              model: User,
+              as: "processedByUser",
+              attributes: ["id", "firstName", "lastName", "email"],
+            },
+          ],
+          order: [["createdAt", "DESC"]],
+        })
+      : [];
+    const returnsSummary = aggregateReturns(returns);
 
-    // ── Aggregate ──────────────────────────────────────────
-    const paymentMethodBreakdown = { CASH: 0, ABA_PAYWAY: 0, KHQR: 0, OTHER: 0 };
-    let totalRevenue = 0;      // net amount actually collected (after discounts)
-    let totalDiscount = 0;     // total customer savings (manual + per-product)
-    let grossSales = 0;        // revenue before any discount
-    let totalItemsSold = 0;
-    let totalRielKhr = 0;      // total Riel collected (from orders charged in KHR)
-    const transactions = [];
+    // ── Split by status: completed = revenue, cancelled = separate ──
+    const { completed, cancelled } = splitOrdersByStatus(orders);
 
-    for (const order of orders) {
-      const orderTotal = Number(order.total) || 0;
-      const orderDiscount = Number(order.discount) || 0;
-      totalRevenue += orderTotal;
-      totalDiscount += orderDiscount;
-      grossSales += orderTotal + orderDiscount;
-      // KHR orders store the exact Riel amount paid at order create.
-      totalRielKhr += Number(order.amountKhr) || 0;
+    // ── Aggregate completed orders ──────────────────────────
+    const agg = aggregateCompletedOrders(completed, paymentMap);
+    const cancelledSummary = aggregateCancelledOrders(cancelled);
 
-      const itemsCount = (order.orderDetails || []).reduce(
-        (sum, d) => sum + (Number(d.qty) || 0), 0
-      );
-      totalItemsSold += itemsCount;
-
-      // Bucket into payment method; orders without a payment record fall
-      // into OTHER so every order's total is accounted for exactly once.
-      const payment = paymentMap[order.id];
-      let method = "OTHER";
-      if (payment) {
-        const raw = (payment.method || "").toUpperCase();
-        if (raw === "CASH") method = "CASH";
-        else if (raw === "ABA_PAYWAY" || raw === "ABA") method = "ABA_PAYWAY";
-        else if (raw === "KHQR" || raw.includes("KHQR")) method = "KHQR";
-        else method = "OTHER";
-      }
-      paymentMethodBreakdown[method] =
-        (paymentMethodBreakdown[method] || 0) + orderTotal;
-
-      transactions.push({
-        id: order.id,
-        orderNumber: order.orderNumber,
-        time: order.createdAt,
-        itemsCount,
-        total: orderTotal,
-        discount: orderDiscount,
-        paymentMethod: method,
-      });
-    }
-
-    const totalTransactions = orders.length;
+    // Net returns out of revenue so Total Revenue reflects what the store
+    // actually kept, not the gross amount before refunds.
+    const totalRefunded = Number(
+      returnsSummary.reduce((s, r) => s + r.refundAmount, 0).toFixed(2)
+    );
+    const netRevenue = Number((agg.totalRevenue - totalRefunded).toFixed(2));
 
     // Rate used to convert KHR → USD equivalent on the frontend Riel card.
     const usdToKhrRate = Number(process.env.ABA_PAYWAY_KHR_RATE) || 4100;
@@ -100,17 +99,27 @@ router.get("/daily-sales", async (req, res) => {
       success: true,
       date,
       summary: {
-        totalRevenue: Number(totalRevenue.toFixed(2)),
-        totalTransactions,
-        totalItemsSold,
-        grossSales: Number(grossSales.toFixed(2)),
-        totalDiscount: Number(totalDiscount.toFixed(2)),
-        netSales: Number(totalRevenue.toFixed(2)),
-        rielKhr: Number(totalRielKhr.toFixed(0)),
+        totalRevenue: netRevenue,
+        totalTransactions: completed.length,
+        totalItemsSold: agg.totalItemsSold,
+        grossSales: Number(agg.grossSales.toFixed(2)),
+        totalDiscount: Number(agg.totalDiscount.toFixed(2)),
+        netSales: netRevenue,
+        rielKhr: Number(agg.totalRielKhr.toFixed(0)),
         usdToKhrRate,
-        paymentMethodBreakdown,
+        paymentMethodBreakdown: agg.paymentMethodBreakdown,
+        cancelled: {
+          count: cancelledSummary.count,
+          totalValue: Number(cancelledSummary.totalValue.toFixed(2)),
+          totalItems: cancelledSummary.totalItems,
+        },
+        returns: {
+          count: returnsSummary.length,
+          totalRefunded,
+        },
       },
-      transactions,
+      transactions: agg.transactions,
+      returns: returnsSummary,
     });
   } catch (error) {
     console.error("❌ Daily sales report error:", error.message);
@@ -146,42 +155,46 @@ router.get("/daily-sales/pdf", async (req, res) => {
       ? await Payment.findAll({ where: { orderId: orderIds } })
       : [];
 
-    const paymentMap = {};
-    for (const p of payments) {
-      if (!paymentMap[p.orderId]) paymentMap[p.orderId] = p;
-    }
+    const paymentMap = buildPaymentMap(payments);
+    const { completed, cancelled } = splitOrdersByStatus(orders);
+    const agg = aggregateCompletedOrders(completed, paymentMap);
+    const cancelledSummary = aggregateCancelledOrders(cancelled);
 
-    const paymentMethodBreakdown = { CASH: 0, ABA_PAYWAY: 0, KHQR: 0, OTHER: 0 };
-    let totalRevenue = 0;      // net amount actually collected (after discounts)
-    let totalDiscount = 0;     // total customer savings (manual + per-product)
-    let totalItemsSold = 0;
-    let totalRielKhr = 0;      // total Riel collected (from orders charged in KHR)
+    // ── Fetch returns for those orders (with processor info) ──
+    const pdfReturns = orderIds.length > 0
+      ? await Return.findAll({
+          where: { orderId: orderIds, status: { [Op.not]: "CANCELLED" } },
+          include: [
+            {
+              model: Order,
+              as: "order",
+              attributes: ["id", "orderNumber"],
+            },
+            {
+              model: Product,
+              as: "product",
+              attributes: ["id", "name"],
+            },
+            {
+              model: User,
+              as: "processedByUser",
+              attributes: ["id", "firstName", "lastName", "email"],
+            },
+          ],
+          order: [["createdAt", "DESC"]],
+        })
+      : [];
+    const returnsSummary = aggregateReturns(pdfReturns);
 
-    for (const order of orders) {
-      const orderTotal = Number(order.total) || 0;
-      const orderDiscount = Number(order.discount) || 0;
-      totalRevenue += orderTotal;
-      totalDiscount += orderDiscount;
-      totalItemsSold += (order.orderDetails || []).reduce(
-        (sum, d) => sum + (Number(d.qty) || 0), 0
-      );
-      totalRielKhr += Number(order.amountKhr) || 0;
-
-      const payment = paymentMap[order.id];
-      let method = "OTHER";
-      if (payment) {
-        const raw = (payment.method || "").toUpperCase();
-        if (raw === "CASH") method = "CASH";
-        else if (raw === "ABA_PAYWAY" || raw === "ABA") method = "ABA_PAYWAY";
-        else if (raw === "KHQR" || raw.includes("KHQR")) method = "KHQR";
-        else method = "OTHER";
-      }
-      paymentMethodBreakdown[method] =
-        (paymentMethodBreakdown[method] || 0) + orderTotal;
-    }
+    // Net returns out of revenue for the PDF display.
+    const pdfTotalRefunded = Number(
+      returnsSummary.reduce((s, r) => s + r.refundAmount, 0).toFixed(2)
+    );
+    const pdfNetRevenue = Number((agg.totalRevenue - pdfTotalRefunded).toFixed(2));
 
     // ── Build PDF ─────────────────────────────────────────
     const doc = new PDFDocument({ margin: 40, size: "A4" });
+    doc.registerFont("Khmer", KHMER_FONT);
 
     // Set response headers
     res.setHeader("Content-Type", "application/pdf");
@@ -189,6 +202,22 @@ router.get("/daily-sales/pdf", async (req, res) => {
       "Content-Disposition",
       `attachment; filename="daily-sales-${date}.pdf"`
     );
+
+    // Crash-safety: if the client disconnects or an error occurs mid-stream,
+    // log it and end the response cleanly instead of letting the unhandled
+    // error propagate and crash the Node process.
+    doc.on("error", (err) => {
+      console.error("❌ Daily PDF stream error:", err.message);
+      if (!res.headersSent) {
+        res.status(500).json({ success: false, message: "PDF generation failed" });
+      } else {
+        res.end();
+      }
+    });
+    res.on("close", () => {
+      if (!doc.destroyed) doc.destroy();
+    });
+
     doc.pipe(res);
 
     // ── Colors ────────────────────────────────────────────
@@ -226,17 +255,17 @@ router.get("/daily-sales/pdf", async (req, res) => {
     const startX = 40;
 
     const summaryItems = [
-      { label: "Total Revenue",  value: `$${totalRevenue.toFixed(2)}`,  color: successColor },
-      { label: "Transactions",   value: String(orders.length),          color: accentColor },
-      { label: "Items Sold",     value: String(totalItemsSold),         color: warningColor },
-      { label: "Discount",       value: `$${totalDiscount.toFixed(2)}`, color: "#d97706" },
+      { label: "Total Revenue",  value: `$${pdfNetRevenue.toFixed(2)}`,  color: successColor },
+      { label: "Transactions",   value: String(completed.length),          color: accentColor },
+      { label: "Items Sold",     value: String(agg.totalItemsSold),         color: warningColor },
+      { label: "Discount",       value: `$${agg.totalDiscount.toFixed(2)}`, color: "#d97706" },
     ];
 
     // Only show the Riel summary box when any KHR was collected that day.
-    if (totalRielKhr > 0) {
+    if (agg.totalRielKhr > 0) {
       summaryItems.push({
         label: "Riel (៛)",
-        value: `៛${Math.round(totalRielKhr).toLocaleString("en-US")}`,
+        value: `៛${Math.round(agg.totalRielKhr).toLocaleString("en-US")}`,
         color: "#0f766e",
       });
     }
@@ -245,11 +274,14 @@ router.get("/daily-sales/pdf", async (req, res) => {
 
     summaryItems.forEach((item, i) => {
       const x = startX + i * (boxW + gap);
+      const isRiel = item.label.includes("Riel");
+      const labelFont = isRiel ? "Khmer" : "Helvetica";
+      const valueFont = isRiel ? "Khmer" : "Helvetica-Bold";
       doc.roundedRect(x, y, boxW, boxH, 6).fillColor("#f8fafc").fill()
          .roundedRect(x, y, boxW, boxH, 6).lineWidth(1).strokeColor(borderColor).stroke();
-      doc.fontSize(10).font("Helvetica").fillColor(grayColor)
+      doc.fontSize(10).font(labelFont).fillColor(grayColor)
          .text(item.label, x + 10, y + 8, { width: boxW - 20, align: "center" });
-      doc.fontSize(14).font("Helvetica-Bold").fillColor(item.color)
+      doc.fontSize(14).font(valueFont).fillColor(item.color)
          .text(item.value, x + 10, y + 24, { width: boxW - 20, align: "center" });
     });
 
@@ -267,7 +299,7 @@ router.get("/daily-sales/pdf", async (req, res) => {
       OTHER:      "#6b7280",
     };
 
-    for (const [method, amount] of Object.entries(paymentMethodBreakdown)) {
+    for (const [method, amount] of Object.entries(agg.paymentMethodBreakdown)) {
       const displayName = method === "ABA_PAYWAY" ? "ABA PayWay"
                         : method.charAt(0) + method.slice(1).toLowerCase();
       const amountNum = Number(amount) || 0;
@@ -281,16 +313,106 @@ router.get("/daily-sales/pdf", async (req, res) => {
     }
 
     // Riel collected that day (when any KHR payment happened).
-    if (totalRielKhr > 0) {
+    if (agg.totalRielKhr > 0) {
       doc.roundedRect(40, y, 505, 24, 4).fillColor("#ccfbf1").fill();
-      doc.fontSize(10).font("Helvetica-Bold").fillColor("#0f766e")
+      doc.fontSize(10).font("Khmer").fillColor("#0f766e")
          .text("Riel (៛)", 50, y + 6);
-      doc.fontSize(10).font("Helvetica-Bold").fillColor("#0f766e")
-         .text(`៛${Math.round(totalRielKhr).toLocaleString("en-US")}`, 480, y + 6, { align: "right" });
+      doc.fontSize(10).font("Khmer").fillColor("#0f766e")
+         .text(`៛${Math.round(agg.totalRielKhr).toLocaleString("en-US")}`, 480, y + 6, { align: "right" });
       y += 30;
     }
 
+    // Cancelled orders summary (separate from revenue)
+    if (cancelledSummary.count > 0) {
+      y += 10;
+      doc.fontSize(13).font("Helvetica-Bold").fillColor(primaryColor)
+         .text("Cancelled Orders", 40, y);
+      y += 22;
+
+      const cancelledBoxes = [
+        { label: "Cancelled", value: String(cancelledSummary.count), color: "#ef4444" },
+        { label: "Cancelled Value", value: `$${cancelledSummary.totalValue.toFixed(2)}`, color: "#ef4444" },
+        { label: "Items Cancelled", value: String(cancelledSummary.totalItems), color: "#ef4444" },
+      ];
+
+      const cBoxW = Math.min(120, (505 - gap * (cancelledBoxes.length - 1)) / cancelledBoxes.length);
+      cancelledBoxes.forEach((item, i) => {
+        const x = startX + i * (cBoxW + gap);
+        doc.roundedRect(x, y, cBoxW, boxH, 6).fillColor("#fef2f2").fill()
+           .roundedRect(x, y, cBoxW, boxH, 6).lineWidth(1).strokeColor("#fecaca").stroke();
+        doc.fontSize(10).font("Helvetica").fillColor(grayColor)
+           .text(item.label, x + 10, y + 8, { width: cBoxW - 20, align: "center" });
+        doc.fontSize(14).font("Helvetica-Bold").fillColor(item.color)
+           .text(item.value, x + 10, y + 24, { width: cBoxW - 20, align: "center" });
+      });
+      y += boxH + 20;
+    }
+
+    // Returns section
+    if (returnsSummary.length > 0) {
+      y += 10;
+      doc.fontSize(13).font("Helvetica-Bold").fillColor("#7c3aed")
+         .text("Returns", 40, y);
+      y += 22;
+
+      const returnBoxes = [
+        { label: "Returns", value: String(returnsSummary.length), color: "#7c3aed" },
+        { label: "Total Refunded", value: `$${returnsSummary.reduce((s, r) => s + r.refundAmount, 0).toFixed(2)}`, color: "#7c3aed" },
+      ];
+
+      const rBoxW = Math.min(120, (505 - gap * (returnBoxes.length - 1)) / returnBoxes.length);
+      returnBoxes.forEach((item, i) => {
+        const x = startX + i * (rBoxW + gap);
+        doc.roundedRect(x, y, rBoxW, boxH, 6).fillColor("#f5f3ff").fill()
+           .roundedRect(x, y, rBoxW, boxH, 6).lineWidth(1).strokeColor("#ddd6fe").stroke();
+        doc.fontSize(10).font("Helvetica").fillColor(grayColor)
+           .text(item.label, x + 10, y + 8, { width: rBoxW - 20, align: "center" });
+        doc.fontSize(14).font("Helvetica-Bold").fillColor(item.color)
+           .text(item.value, x + 10, y + 24, { width: rBoxW - 20, align: "center" });
+      });
+      y += boxH + 20;
+    }
+
     y += 10;
+
+    // ── Returns Table ─────────────────────────────────────
+    if (returnsSummary.length > 0) {
+      doc.fontSize(13).font("Helvetica-Bold").fillColor("#7c3aed")
+         .text("Returns", 40, y);
+      y += 22;
+
+      const rColX = [40, 100, 260, 370, 430, 510];
+      const rColW = [60, 160, 110, 60, 80, 35];
+      const rHeaders = ["#", "Order No.", "Product", "Qty", "Processed By", "Method"];
+
+      doc.roundedRect(40, y, 505, 20, 4).fillColor("#7c3aed").fill();
+      doc.fontSize(9).font("Helvetica-Bold").fillColor("#ffffff");
+      rHeaders.forEach((h, i) => {
+        doc.text(h, rColX[i] + 4, y + 4, { width: rColW[i], align: i < 2 ? "left" : "center" });
+      });
+      y += 26;
+
+      doc.fontSize(8).font("Helvetica");
+      for (let i = 0; i < Math.min(returnsSummary.length, 20); i++) {
+        const r = returnsSummary[i];
+        if (i % 2 === 0) {
+          doc.roundedRect(40, y, 505, 18, 3).fillColor("#faf5ff").fill();
+        }
+        doc.fillColor("#111827");
+        doc.text(String(i + 1),              rColX[0] + 4, y + 4, { width: rColW[0], align: "center" });
+        doc.text(r.orderNumber || "",        rColX[1] + 4, y + 4, { width: rColW[1] });
+        doc.text(r.productName || "—",       rColX[2] + 4, y + 4, { width: rColW[2] });
+        doc.text(String(r.quantity),         rColX[3] + 4, y + 4, { width: rColW[3], align: "center" });
+        doc.text(r.processedBy || "Unknown", rColX[4] + 4, y + 4, { width: rColW[4] });
+        doc.text(r.refundMethod || "Cash",   rColX[5] + 4, y + 4, { width: rColW[5], align: "center" });
+        y += 22;
+
+        if (y > 750) {
+          doc.addPage();
+          y = 40;
+        }
+      }
+    }
 
     // ── Transactions Table ────────────────────────────────
     doc.fontSize(13).font("Helvetica-Bold").fillColor(primaryColor)
@@ -312,20 +434,9 @@ router.get("/daily-sales/pdf", async (req, res) => {
 
     // Table rows
     doc.fontSize(8).font("Helvetica");
-    for (let i = 0; i < Math.min(orders.length, 30); i++) {
-      const order = orders[i];
-      const payment = paymentMap[order.id];
-      let method = "OTHER";
-      if (payment) {
-        const raw = (payment.method || "").toUpperCase();
-        if (raw === "CASH") method = "CASH";
-        else if (raw === "ABA_PAYWAY" || raw === "ABA") method = "ABA";
-        else if (raw === "KHQR" || raw.includes("KHQR")) method = "KHQR";
-      }
-      const itemsCount = (order.orderDetails || []).reduce(
-        (sum, d) => sum + (Number(d.qty) || 0), 0
-      );
-      const orderDiscount = Number(order.discount) || 0;
+    for (let i = 0; i < Math.min(agg.transactions.length, 30); i++) {
+      const tx = agg.transactions[i];
+      const method = tx.paymentMethod;
 
       // Alternating row bg
       if (i % 2 === 0) {
@@ -334,11 +445,11 @@ router.get("/daily-sales/pdf", async (req, res) => {
 
       doc.fillColor("#111827");
       doc.text(String(i + 1),           colX[0] + 4, y + 4, { width: colW[0], align: "center" });
-      doc.text(order.orderNumber || "", colX[1] + 4, y + 4, { width: colW[1] });
-      doc.text(String(itemsCount),       colX[2] + 4, y + 4, { width: colW[2] });
-      doc.text(`$${Number(order.total).toFixed(2)}`, colX[3] + 4, y + 4, { width: colW[3] });
-      doc.text(`$${orderDiscount.toFixed(2)}`,        colX[4] + 4, y + 4, { width: colW[4] });
-      doc.text(method,                   colX[5] + 4, y + 4, { width: colW[5] });
+      doc.text(tx.orderNumber || "",    colX[1] + 4, y + 4, { width: colW[1] });
+      doc.text(String(tx.itemsCount),   colX[2] + 4, y + 4, { width: colW[2] });
+      doc.text(`$${tx.total.toFixed(2)}`, colX[3] + 4, y + 4, { width: colW[3] });
+      doc.text(`$${tx.discount.toFixed(2)}`, colX[4] + 4, y + 4, { width: colW[4] });
+      doc.text(method,                  colX[5] + 4, y + 4, { width: colW[5] });
       y += 22;
 
       // New page if near end
@@ -377,17 +488,31 @@ router.get("/daily-sales/pdf", async (req, res) => {
 // ─── GET: Monthly Sales Report JSON (admin only) ────────────
 router.get("/monthly-sales", requireRole("admin"), async (req, res) => {
   try {
-    const year  = Number(req.query.year)  || dayjs().year();
-    const month = String(req.query.month || dayjs().month() + 1).padStart(2, "0");
-    const dateStr = `${year}-${month}`;
+    // Accept either year/month (single month) or dateFrom/dateTo (range).
+    // Range params take priority when both are present.
+    const dateFrom = req.query.dateFrom;
+    const dateTo   = req.query.dateTo;
+    let dateStr;
+    let rangeStart, rangeEnd;
+    let isRange = false;
 
-    const monthStart = new Date(`${dateStr}-01T00:00:00.000Z`);
-    const nextMonth   = new Date(monthStart);
-    nextMonth.setUTCMonth(nextMonth.getUTCMonth() + 1);
+    if (dateFrom && dateTo) {
+      isRange = true;
+      dateStr = `${dateFrom} to ${dateTo}`;
+      rangeStart = new Date(`${dateFrom}T00:00:00.000Z`);
+      rangeEnd   = new Date(`${dateTo}T23:59:59.999Z`);
+    } else {
+      const year  = Number(req.query.year)  || dayjs().year();
+      const month = String(req.query.month || dayjs().month() + 1).padStart(2, "0");
+      dateStr = `${year}-${month}`;
+      rangeStart = new Date(`${dateStr}-01T00:00:00.000Z`);
+      rangeEnd   = new Date(rangeStart);
+      rangeEnd.setUTCMonth(rangeEnd.getUTCMonth() + 1);
+    }
 
     const orders = await Order.findAll({
       where: {
-        createdAt: { [Op.gte]: monthStart, [Op.lt]: nextMonth },
+        createdAt: { [Op.gte]: rangeStart, [Op.lt]: rangeEnd },
       },
       include: [{ model: OrderDetail, as: "orderDetails" }],
       order: [["createdAt", "ASC"]],
@@ -398,52 +523,46 @@ router.get("/monthly-sales", requireRole("admin"), async (req, res) => {
       ? await Payment.findAll({ where: { orderId: orderIds } })
       : [];
 
-    const paymentMap = {};
-    for (const p of payments) {
-      if (!paymentMap[p.orderId]) paymentMap[p.orderId] = p;
-    }
+    // ── Fetch returns for those orders (with processor info) ──
+    const monthlyReturns = orderIds.length > 0
+      ? await Return.findAll({
+          where: { orderId: orderIds, status: { [Op.not]: "CANCELLED" } },
+          include: [
+            {
+              model: Order,
+              as: "order",
+              attributes: ["id", "orderNumber"],
+            },
+            {
+              model: Product,
+              as: "product",
+              attributes: ["id", "name"],
+            },
+            {
+              model: User,
+              as: "processedByUser",
+              attributes: ["id", "firstName", "lastName", "email"],
+            },
+          ],
+          order: [["createdAt", "DESC"]],
+        })
+      : [];
+    const monthlyReturnsSummary = aggregateReturns(monthlyReturns);
 
-    // ── Aggregate by day ────────────────────────────────────
-    const dayMap = {};
-    const paymentMethodBreakdown = { CASH: 0, ABA_PAYWAY: 0, KHQR: 0, OTHER: 0 };
-    let totalRevenue = 0, totalDiscount = 0, grossSales = 0, totalItemsSold = 0, totalRielKhr = 0;
+    const paymentMap = buildPaymentMap(payments);
+    const { completed, cancelled } = splitOrdersByStatus(orders);
+    const agg = aggregateCompletedOrders(completed, paymentMap);
+    const cancelledSummary = aggregateCancelledOrders(cancelled);
 
-    for (const order of orders) {
-      const orderTotal = Number(order.total) || 0;
-      const orderDiscount = Number(order.discount) || 0;
-      totalRevenue += orderTotal;
-      totalDiscount += orderDiscount;
-      grossSales += orderTotal + orderDiscount;
-      totalRielKhr += Number(order.amountKhr) || 0;
-
-      const itemsCount = (order.orderDetails || []).reduce(
-        (sum, d) => sum + (Number(d.qty) || 0), 0
-      );
-      totalItemsSold += itemsCount;
-
-      const day = dayjs(order.createdAt).format("YYYY-MM-DD");
-      if (!dayMap[day]) dayMap[day] = { date: day, orders: 0, totalSales: 0, totalDiscount: 0, totalItemsSold: 0 };
-      dayMap[day].orders++;
-      dayMap[day].totalSales += orderTotal;
-      dayMap[day].totalDiscount += orderDiscount;
-      dayMap[day].totalItemsSold += itemsCount;
-
-      const payment = paymentMap[order.id];
-      let method = "OTHER";
-      if (payment) {
-        const raw = (payment.method || "").toUpperCase();
-        if (raw === "CASH") method = "CASH";
-        else if (raw === "ABA_PAYWAY" || raw === "ABA") method = "ABA_PAYWAY";
-        else if (raw === "KHQR" || raw.includes("KHQR")) method = "KHQR";
-        else method = "OTHER";
-      }
-      paymentMethodBreakdown[method] =
-        (paymentMethodBreakdown[method] || 0) + orderTotal;
-    }
-
-    const dailyBreakdown = Object.values(dayMap).sort(
-      (a, b) => a.date.localeCompare(b.date)
+    // Net returns out of revenue so Total Revenue reflects what the store
+    // actually kept, not the gross amount before refunds.
+    const monthlyTotalRefunded = Number(
+      monthlyReturnsSummary.reduce((s, r) => s + r.refundAmount, 0).toFixed(2)
     );
+    const monthlyNetRevenue = Number((agg.totalRevenue - monthlyTotalRefunded).toFixed(2));
+
+    // ── Aggregate by day (completed orders only) ────────────
+    const dailyBreakdown = buildDailyBreakdown(completed);
 
     const usdToKhrRate = Number(process.env.ABA_PAYWAY_KHR_RATE) || 4100;
 
@@ -451,17 +570,29 @@ router.get("/monthly-sales", requireRole("admin"), async (req, res) => {
       success: true,
       date: dateStr,
       summary: {
-        totalRevenue:   Number(totalRevenue.toFixed(2)),
-        totalTransactions: orders.length,
-        totalItemsSold,
-        grossSales:     Number(grossSales.toFixed(2)),
-        totalDiscount:  Number(totalDiscount.toFixed(2)),
-        netSales:       Number(totalRevenue.toFixed(2)),
-        rielKhr:        Number(totalRielKhr.toFixed(0)),
+        totalRevenue:   monthlyNetRevenue,
+        totalTransactions: completed.length,
+        totalItemsSold: agg.totalItemsSold,
+        grossSales:     Number(agg.grossSales.toFixed(2)),
+        totalDiscount:  Number(agg.totalDiscount.toFixed(2)),
+        netSales:       monthlyNetRevenue,
+        rielKhr:        Number(agg.totalRielKhr.toFixed(0)),
         usdToKhrRate,
-        paymentMethodBreakdown,
+        paymentMethodBreakdown: agg.paymentMethodBreakdown,
+        cancelled: {
+          count: cancelledSummary.count,
+          totalValue: Number(cancelledSummary.totalValue.toFixed(2)),
+          totalItems: cancelledSummary.totalItems,
+        },
+        returns: {
+          count: monthlyReturnsSummary.length,
+          totalRefunded: Number(
+            monthlyReturnsSummary.reduce((s, r) => s + r.refundAmount, 0).toFixed(2)
+          ),
+        },
       },
       dailyBreakdown,
+      returns: monthlyReturnsSummary,
     });
   } catch (error) {
     console.error("❌ Monthly sales report error:", error.message);
@@ -472,17 +603,31 @@ router.get("/monthly-sales", requireRole("admin"), async (req, res) => {
 // ─── GET: Download Monthly Sales Report PDF (admin only) ───
 router.get("/monthly-sales/pdf", requireRole("admin"), async (req, res) => {
   try {
-    const year  = Number(req.query.year)  || dayjs().year();
-    const month = String(req.query.month || dayjs().month() + 1).padStart(2, "0");
-    const dateStr = `${year}-${month}`;
+    // Accept either year/month (single month) or dateFrom/dateTo (range).
+    // Range params take priority when both are present.
+    const dateFrom = req.query.dateFrom;
+    const dateTo   = req.query.dateTo;
+    let dateStr;
+    let rangeStart, rangeEnd;
+    let isRange = false;
 
-    const monthStart = new Date(`${dateStr}-01T00:00:00.000Z`);
-    const nextMonth   = new Date(monthStart);
-    nextMonth.setUTCMonth(nextMonth.getUTCMonth() + 1);
+    if (dateFrom && dateTo) {
+      isRange = true;
+      dateStr = `${dateFrom} to ${dateTo}`;
+      rangeStart = new Date(`${dateFrom}T00:00:00.000Z`);
+      rangeEnd   = new Date(`${dateTo}T23:59:59.999Z`);
+    } else {
+      const year  = Number(req.query.year)  || dayjs().year();
+      const month = String(req.query.month || dayjs().month() + 1).padStart(2, "0");
+      dateStr = `${year}-${month}`;
+      rangeStart = new Date(`${dateStr}-01T00:00:00.000Z`);
+      rangeEnd   = new Date(rangeStart);
+      rangeEnd.setUTCMonth(rangeEnd.getUTCMonth() + 1);
+    }
 
     const orders = await Order.findAll({
       where: {
-        createdAt: { [Op.gte]: monthStart, [Op.lt]: nextMonth },
+        createdAt: { [Op.gte]: rangeStart, [Op.lt]: rangeEnd },
       },
       include: [{ model: OrderDetail, as: "orderDetails" }],
       order: [["createdAt", "ASC"]],
@@ -493,59 +638,73 @@ router.get("/monthly-sales/pdf", requireRole("admin"), async (req, res) => {
       ? await Payment.findAll({ where: { orderId: orderIds } })
       : [];
 
-    const paymentMap = {};
-    for (const p of payments) {
-      if (!paymentMap[p.orderId]) paymentMap[p.orderId] = p;
-    }
+    const paymentMap = buildPaymentMap(payments);
+    const { completed, cancelled } = splitOrdersByStatus(orders);
+    const agg = aggregateCompletedOrders(completed, paymentMap);
+    const cancelledSummary = aggregateCancelledOrders(cancelled);
 
-    const paymentMethodBreakdown = { CASH: 0, ABA_PAYWAY: 0, KHQR: 0, OTHER: 0 };
-    let totalRevenue = 0, totalDiscount = 0, totalItemsSold = 0, totalRielKhr = 0;
+    const dailyBreakdown = buildDailyBreakdown(completed);
 
-    const dayMap = {};
-    for (const order of orders) {
-      const orderTotal = Number(order.total) || 0;
-      const orderDiscount = Number(order.discount) || 0;
-      totalRevenue += orderTotal;
-      totalDiscount += orderDiscount;
-      totalItemsSold += (order.orderDetails || []).reduce(
-        (sum, d) => sum + (Number(d.qty) || 0), 0
-      );
-      totalRielKhr += Number(order.amountKhr) || 0;
+    // ── Fetch returns for those orders (with processor info) ──
+    const pdfReturns = orderIds.length > 0
+      ? await Return.findAll({
+          where: { orderId: orderIds, status: { [Op.not]: "CANCELLED" } },
+          include: [
+            {
+              model: Order,
+              as: "order",
+              attributes: ["id", "orderNumber"],
+            },
+            {
+              model: Product,
+              as: "product",
+              attributes: ["id", "name"],
+            },
+            {
+              model: User,
+              as: "processedByUser",
+              attributes: ["id", "firstName", "lastName", "email"],
+            },
+          ],
+          order: [["createdAt", "DESC"]],
+        })
+      : [];
+    const returnsSummary = aggregateReturns(pdfReturns);
 
-      const day = dayjs(order.createdAt).format("YYYY-MM-DD");
-      if (!dayMap[day]) dayMap[day] = { date: day, orders: 0, totalSales: 0, totalDiscount: 0, totalItemsSold: 0 };
-      dayMap[day].orders++;
-      dayMap[day].totalSales += orderTotal;
-      dayMap[day].totalDiscount += orderDiscount;
-      dayMap[day].totalItemsSold += (order.orderDetails || []).reduce(
-        (sum, d) => sum + (Number(d.qty) || 0), 0
-      );
-
-      const payment = paymentMap[order.id];
-      let method = "OTHER";
-      if (payment) {
-        const raw = (payment.method || "").toUpperCase();
-        if (raw === "CASH") method = "CASH";
-        else if (raw === "ABA_PAYWAY" || raw === "ABA") method = "ABA_PAYWAY";
-        else if (raw === "KHQR" || raw.includes("KHQR")) method = "KHQR";
-        else method = "OTHER";
-      }
-      paymentMethodBreakdown[method] =
-        (paymentMethodBreakdown[method] || 0) + orderTotal;
-    }
-
-    const dailyBreakdown = Object.values(dayMap).sort(
-      (a, b) => a.date.localeCompare(b.date)
+    // Net returns out of revenue for the PDF display.
+    const mPdfTotalRefunded = Number(
+      returnsSummary.reduce((s, r) => s + r.refundAmount, 0).toFixed(2)
     );
+    const mPdfNetRevenue = Number((agg.totalRevenue - mPdfTotalRefunded).toFixed(2));
 
     // ── Build PDF ─────────────────────────────────────────
     const doc = new PDFDocument({ margin: 40, size: "A4" });
+    doc.registerFont("Khmer", KHMER_FONT);
+
+    const filename = isRange
+      ? `monthly-sales-${dateStr}.pdf`
+      : `monthly-sales-${dateStr}.pdf`;
 
     res.setHeader("Content-Type", "application/pdf");
     res.setHeader(
       "Content-Disposition",
-      `attachment; filename="monthly-sales-${dateStr}.pdf"`
+      `attachment; filename="${filename}"`
     );
+
+    // Crash-safety: same pattern as daily PDF — prevent server crash
+    // if the stream errors mid-write.
+    doc.on("error", (err) => {
+      console.error("❌ Monthly PDF stream error:", err.message);
+      if (!res.headersSent) {
+        res.status(500).json({ success: false, message: "PDF generation failed" });
+      } else {
+        res.end();
+      }
+    });
+    res.on("close", () => {
+      if (!doc.destroyed) doc.destroy();
+    });
+
     doc.pipe(res);
 
     const primaryColor = "#1e40af";
@@ -561,11 +720,16 @@ router.get("/monthly-sales/pdf", requireRole("admin"), async (req, res) => {
        .text("LEVA Store", 40, 40);
     doc.fontSize(10).font("Helvetica").fillColor(grayColor)
        .text("Monthly Sales Report", 40, 68);
+    let periodLabel;
+    if (isRange) {
+      const from = dayjs(rangeStart).format("MMMM D, YYYY");
+      const to   = dayjs(rangeEnd).format("MMMM D, YYYY");
+      periodLabel = `Period: ${from} – ${to}`;
+    } else {
+      periodLabel = `Period: ${dayjs(dateStr).format("MMMM YYYY")}`;
+    }
     doc.fontSize(9).fillColor(grayColor)
-       .text(
-         `Period: ${dayjs(dateStr).format("MMMM YYYY")}`,
-         40, 84
-       );
+       .text(periodLabel, 40, 84);
 
     doc.moveTo(40, 100).lineTo(545, 100)
        .lineWidth(1.5).strokeColor(accentColor).stroke();
@@ -579,16 +743,16 @@ router.get("/monthly-sales/pdf", requireRole("admin"), async (req, res) => {
 
     const boxH = 52, gap = 12, startX = 40;
     const summaryItems = [
-      { label: "Total Revenue",  value: `$${totalRevenue.toFixed(2)}`,   color: successColor },
-      { label: "Transactions",   value: String(orders.length),            color: accentColor },
-      { label: "Items Sold",     value: String(totalItemsSold),           color: warningColor },
-      { label: "Discount",       value: `$${totalDiscount.toFixed(2)}`,  color: "#d97706" },
+      { label: "Total Revenue",  value: `$${mPdfNetRevenue.toFixed(2)}`,   color: successColor },
+      { label: "Transactions",   value: String(completed.length),             color: accentColor },
+      { label: "Items Sold",     value: String(agg.totalItemsSold),           color: warningColor },
+      { label: "Discount",       value: `$${agg.totalDiscount.toFixed(2)}`,  color: "#d97706" },
     ];
 
-    if (totalRielKhr > 0) {
+    if (agg.totalRielKhr > 0) {
       summaryItems.push({
         label: "Riel (៛)",
-        value: `៛${Math.round(totalRielKhr).toLocaleString("en-US")}`,
+        value: `៛${Math.round(agg.totalRielKhr).toLocaleString("en-US")}`,
         color: "#0f766e",
       });
     }
@@ -597,11 +761,14 @@ router.get("/monthly-sales/pdf", requireRole("admin"), async (req, res) => {
 
     summaryItems.forEach((item, i) => {
       const x = startX + i * (boxW + gap);
+      const isRiel = item.label.includes("Riel");
+      const labelFont = isRiel ? "Khmer" : "Helvetica";
+      const valueFont = isRiel ? "Khmer" : "Helvetica-Bold";
       doc.roundedRect(x, y, boxW, boxH, 6).fillColor("#f8fafc").fill()
          .roundedRect(x, y, boxW, boxH, 6).lineWidth(1).strokeColor(borderColor).stroke();
-      doc.fontSize(10).font("Helvetica").fillColor(grayColor)
+      doc.fontSize(10).font(labelFont).fillColor(grayColor)
          .text(item.label, x + 10, y + 8, { width: boxW - 20, align: "center" });
-      doc.fontSize(14).font("Helvetica-Bold").fillColor(item.color)
+      doc.fontSize(14).font(valueFont).fillColor(item.color)
          .text(item.value, x + 10, y + 24, { width: boxW - 20, align: "center" });
     });
 
@@ -616,7 +783,7 @@ router.get("/monthly-sales/pdf", requireRole("admin"), async (req, res) => {
       CASH: "#16a34a", ABA_PAYWAY: "#2563eb", KHQR: "#d97706", OTHER: "#6b7280",
     };
 
-    for (const [method, amount] of Object.entries(paymentMethodBreakdown)) {
+    for (const [method, amount] of Object.entries(agg.paymentMethodBreakdown)) {
       const displayName = method === "ABA_PAYWAY" ? "ABA PayWay"
                         : method.charAt(0) + method.slice(1).toLowerCase();
       const amountNum = Number(amount) || 0;
@@ -629,16 +796,106 @@ router.get("/monthly-sales/pdf", requireRole("admin"), async (req, res) => {
       y += 30;
     }
 
-    if (totalRielKhr > 0) {
+    if (agg.totalRielKhr > 0) {
       doc.roundedRect(40, y, 505, 24, 4).fillColor("#ccfbf1").fill();
-      doc.fontSize(10).font("Helvetica-Bold").fillColor("#0f766e")
+      doc.fontSize(10).font("Khmer").fillColor("#0f766e")
          .text("Riel (៛)", 50, y + 6);
-      doc.fontSize(10).font("Helvetica-Bold").fillColor("#0f766e")
-         .text(`៛${Math.round(totalRielKhr).toLocaleString("en-US")}`, 480, y + 6, { align: "right" });
+      doc.fontSize(10).font("Khmer").fillColor("#0f766e")
+         .text(`៛${Math.round(agg.totalRielKhr).toLocaleString("en-US")}`, 480, y + 6, { align: "right" });
       y += 30;
     }
 
+    // Cancelled orders summary (separate from revenue)
+    if (cancelledSummary.count > 0) {
+      y += 10;
+      doc.fontSize(13).font("Helvetica-Bold").fillColor(primaryColor)
+         .text("Cancelled Orders", 40, y);
+      y += 22;
+
+      const cancelledBoxes = [
+        { label: "Cancelled", value: String(cancelledSummary.count), color: "#ef4444" },
+        { label: "Cancelled Value", value: `$${cancelledSummary.totalValue.toFixed(2)}`, color: "#ef4444" },
+        { label: "Items Cancelled", value: String(cancelledSummary.totalItems), color: "#ef4444" },
+      ];
+
+      const cBoxW = Math.min(120, (505 - gap * (cancelledBoxes.length - 1)) / cancelledBoxes.length);
+      cancelledBoxes.forEach((item, i) => {
+        const x = startX + i * (cBoxW + gap);
+        doc.roundedRect(x, y, cBoxW, boxH, 6).fillColor("#fef2f2").fill()
+           .roundedRect(x, y, cBoxW, boxH, 6).lineWidth(1).strokeColor("#fecaca").stroke();
+        doc.fontSize(10).font("Helvetica").fillColor(grayColor)
+           .text(item.label, x + 10, y + 8, { width: cBoxW - 20, align: "center" });
+        doc.fontSize(14).font("Helvetica-Bold").fillColor(item.color)
+           .text(item.value, x + 10, y + 24, { width: cBoxW - 20, align: "center" });
+      });
+      y += boxH + 20;
+    }
+
+    // Returns section
+    if (returnsSummary.length > 0) {
+      y += 10;
+      doc.fontSize(13).font("Helvetica-Bold").fillColor("#7c3aed")
+         .text("Returns", 40, y);
+      y += 22;
+
+      const returnBoxes = [
+        { label: "Returns", value: String(returnsSummary.length), color: "#7c3aed" },
+        { label: "Total Refunded", value: `$${returnsSummary.reduce((s, r) => s + r.refundAmount, 0).toFixed(2)}`, color: "#7c3aed" },
+      ];
+
+      const rBoxW = Math.min(120, (505 - gap * (returnBoxes.length - 1)) / returnBoxes.length);
+      returnBoxes.forEach((item, i) => {
+        const x = startX + i * (rBoxW + gap);
+        doc.roundedRect(x, y, rBoxW, boxH, 6).fillColor("#f5f3ff").fill()
+           .roundedRect(x, y, rBoxW, boxH, 6).lineWidth(1).strokeColor("#ddd6fe").stroke();
+        doc.fontSize(10).font("Helvetica").fillColor(grayColor)
+           .text(item.label, x + 10, y + 8, { width: rBoxW - 20, align: "center" });
+        doc.fontSize(14).font("Helvetica-Bold").fillColor(item.color)
+           .text(item.value, x + 10, y + 24, { width: rBoxW - 20, align: "center" });
+      });
+      y += boxH + 20;
+    }
+
     y += 10;
+
+    // ── Returns Table ─────────────────────────────────────
+    if (returnsSummary.length > 0) {
+      doc.fontSize(13).font("Helvetica-Bold").fillColor("#7c3aed")
+         .text("Returns", 40, y);
+      y += 22;
+
+      const rColX = [40, 100, 260, 370, 430, 510];
+      const rColW = [60, 160, 110, 60, 80, 35];
+      const rHeaders = ["#", "Order No.", "Product", "Qty", "Processed By", "Method"];
+
+      doc.roundedRect(40, y, 505, 20, 4).fillColor("#7c3aed").fill();
+      doc.fontSize(9).font("Helvetica-Bold").fillColor("#ffffff");
+      rHeaders.forEach((h, i) => {
+        doc.text(h, rColX[i] + 4, y + 4, { width: rColW[i], align: i < 2 ? "left" : "center" });
+      });
+      y += 26;
+
+      doc.fontSize(8).font("Helvetica");
+      for (let i = 0; i < Math.min(returnsSummary.length, 20); i++) {
+        const r = returnsSummary[i];
+        if (i % 2 === 0) {
+          doc.roundedRect(40, y, 505, 18, 3).fillColor("#faf5ff").fill();
+        }
+        doc.fillColor("#111827");
+        doc.text(String(i + 1),              rColX[0] + 4, y + 4, { width: rColW[0], align: "center" });
+        doc.text(r.orderNumber || "",        rColX[1] + 4, y + 4, { width: rColW[1] });
+        doc.text(r.productName || "—",       rColX[2] + 4, y + 4, { width: rColW[2] });
+        doc.text(String(r.quantity),         rColX[3] + 4, y + 4, { width: rColW[3], align: "center" });
+        doc.text(r.processedBy || "Unknown", rColX[4] + 4, y + 4, { width: rColW[4] });
+        doc.text(r.refundMethod || "Cash",   rColX[5] + 4, y + 4, { width: rColW[5], align: "center" });
+        y += 22;
+
+        if (y > 750) {
+          doc.addPage();
+          y = 40;
+        }
+      }
+    }
 
     // ── Daily Subtotals Table ─────────────────────────────
     doc.fontSize(13).font("Helvetica-Bold").fillColor(primaryColor)
@@ -656,12 +913,23 @@ router.get("/monthly-sales/pdf", requireRole("admin"), async (req, res) => {
     });
     y += 26;
 
+    // Build per-day payment method breakdown from completed orders
+    const dayMethodBreakdown = {};
+    for (const order of completed) {
+      const day = dayjs(order.createdAt).format("YYYY-MM-DD");
+      if (!dayMethodBreakdown[day]) dayMethodBreakdown[day] = { CASH: 0, ABA_PAYWAY: 0, KHQR: 0, OTHER: 0 };
+      const method = getPaymentMethod(paymentMap, order.id);
+      dayMethodBreakdown[day][method] += Number(order.total) || 0;
+    }
+
     doc.fontSize(8).font("Helvetica");
-    for (let i = 0; i < Math.min(dailyBreakdown.length, 31); i++) {
+    for (let i = 0; i < dailyBreakdown.length; i++) {
       const d = dailyBreakdown[i];
       const dayDate = dayjs(d.date).format("MMM D, YYYY");
-      const methodLabel = paymentMethodBreakdown[d.date]
-        ? Object.entries(paymentMethodBreakdown).find(([_, v]) => v === d.totalSales)?.[0] || "—"
+      const dayMethods = dayMethodBreakdown[d.date] || { CASH: 0, ABA_PAYWAY: 0, KHQR: 0, OTHER: 0 };
+      const topMethod = Object.entries(dayMethods).sort((a, b) => (b[1] || 0) - (a[1] || 0))[0];
+      const methodLabel = topMethod && topMethod[1] > 0
+        ? (topMethod[0] === "ABA_PAYWAY" ? "ABA PayWay" : topMethod[0].charAt(0) + topMethod[0].slice(1).toLowerCase())
         : "—";
 
       if (i % 2 === 0) {
@@ -702,6 +970,113 @@ router.get("/monthly-sales/pdf", requireRole("admin"), async (req, res) => {
     if (!res.headersSent) {
       res.status(500).json({ success: false, message: error.message });
     }
+  }
+});
+
+// ─── GET: Stock Aging Report (admin only) ────────────────────
+// Returns all ProductBatch rows with qty > 0, sorted by receivedDate ASC
+// (oldest stock first). Includes computed daysInStock and daysUntilExpiry.
+// Supports optional filters: minDaysInStock, productId, startDate, endDate.
+router.get("/aging", requireRole("admin"), async (req, res) => {
+  try {
+    const minDaysInStock = Number(req.query.minDaysInStock) || 0;
+    const productIdFilter = req.query.productId
+      ? Number(req.query.productId)
+      : null;
+
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    const todayStr = today.toISOString().slice(0, 10);
+
+    const whereClause = { qty: { [Op.gt]: 0 } };
+
+    if (productIdFilter) {
+      whereClause.productId = productIdFilter;
+    }
+
+    if (req.query.startDate || req.query.endDate) {
+      const dateRange = {};
+      if (req.query.startDate) {
+        dateRange[Op.gte] = req.query.startDate;
+      }
+      if (req.query.endDate) {
+        dateRange[Op.lte] = req.query.endDate;
+      }
+      whereClause.receivedDate = dateRange;
+    }
+
+    const batches = await ProductBatch.findAll({
+      where: whereClause,
+      order: [["receivedDate", "ASC"], ["expireDate", "ASC NULLS LAST"]],
+      include: [
+        {
+          model: Product,
+          as: "product",
+          attributes: ["id", "name", "sku", "price"],
+        },
+      ],
+    });
+
+    // Compute derived fields: daysInStock and daysUntilExpiry
+    const data = batches
+      .map((batch) => {
+        const received = new Date(`${batch.receivedDate}T00:00:00`);
+        const daysInStock = Math.floor((today - received) / 86_400_000);
+
+        let daysUntilExpiry = null;
+        if (batch.expireDate) {
+          const expire = new Date(`${batch.expireDate}T00:00:00`);
+          daysUntilExpiry = Math.ceil((expire - today) / 86_400_000);
+        }
+
+        return {
+          id: batch.id,
+          productId: batch.productId,
+          productName: batch.product?.name,
+          sku: batch.product?.sku,
+          batchNumber: batch.batchNumber,
+          qty: Number(batch.qty),
+          costPrice: batch.costPrice != null ? Number(batch.costPrice) : null,
+          receivedDate: batch.receivedDate,
+          expireDate: batch.expireDate,
+          daysInStock,
+          daysUntilExpiry,
+        };
+      })
+      .filter((row) => row.daysInStock >= minDaysInStock);
+
+    // Summary stats
+    const totalBatches = data.length;
+    const totalQty = data.reduce((s, r) => s + r.qty, 0);
+    const avgDaysInStock =
+      totalBatches > 0
+        ? Math.round(data.reduce((s, r) => s + r.daysInStock, 0) / totalBatches)
+        : 0;
+    const oldestBatch = data.length > 0 ? data[0] : null;
+    const nearExpiryCount = data.filter(
+      (r) => r.daysUntilExpiry !== null && r.daysUntilExpiry <= 7 && r.daysUntilExpiry >= 0
+    ).length;
+
+    res.json({
+      success: true,
+      summary: {
+        totalBatches,
+        totalQty,
+        avgDaysInStock,
+        oldestBatch,
+        nearExpiryCount,
+        filters: {
+          minDaysInStock,
+          productId: productIdFilter,
+          startDate: req.query.startDate || null,
+          endDate: req.query.endDate || null,
+        },
+      },
+      data,
+    });
+  } catch (error) {
+    console.error("Stock aging report error:", error);
+    res.status(500).json({ success: false, message: error.message });
   }
 });
 
