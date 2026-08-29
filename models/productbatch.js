@@ -46,6 +46,12 @@ module.exports = (sequelize, DataTypes) => {
         field: "cost_price",
         allowNull: true,
       },
+      expiredMovementCreated: {
+        type: DataTypes.BOOLEAN,
+        field: "expired_movement_created",
+        allowNull: false,
+        defaultValue: false,
+      },
     },
     {
       sequelize,

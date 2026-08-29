@@ -59,7 +59,19 @@ app.use(express.json());
 
 db.sequelize
   .authenticate()
-  .then(() => console.log("Database connected successfully"))
+  .then(async () => {
+    console.log("Database connected successfully");
+
+    // Run automated expiry sweep on startup (catches anything that
+    // expired while the server was down). The sweep is idempotent —
+    // already-processed batches are skipped.
+    try {
+      const { startExpirySweep } = require("./src/jobs/expirySweep");
+      startExpirySweep();
+    } catch (err) {
+      console.error("Failed to start expiry sweep:", err);
+    }
+  })
   .catch((err) => console.error("Unable to connect to database:", err));
 
 // ─── Public Routes ─────────────────────────────────────────────────────────
@@ -78,7 +90,7 @@ app.use("/api/v1/payments",   authenticate, paymentRoute);
 
 // ─── Admin Only ────────────────────────────────────────────────────────────
 app.use("/api/v1/users",     authenticate, authorizeRoles("admin"), userRoute);
-app.use("/api/v1/dashboard", authenticate, authorizeRoles("admin"), dashboardRoute);
+app.use("/api/v1/dashboard", authenticate, authorizeRoles("admin", "cashier"), dashboardRoute);
 app.use("/api/v1/reports",   authenticate, authorizeRoles("admin", "cashier"), reportRoute);
 
 // ─── Inventory & Stock Movements (authenticated) ────────

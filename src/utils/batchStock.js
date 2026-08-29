@@ -3,7 +3,7 @@
  * through these so the invariant `Products.qty = SUM(ProductBatches.qty)`
  * and `Products.expire_date = soonest batch expire_date (qty > 0)` holds.
  */
-const { Product, ProductBatch, Inventory, StockMovement, OrderDetailBatch } = require("../../models");
+const { sequelize, Product, ProductBatch, Inventory, StockMovement, OrderDetailBatch } = require("../../models");
 const { Op } = require("sequelize");
 
 // ─── EXISTING FUNCTIONS (unchanged) ────────────────────────
@@ -104,8 +104,19 @@ async function deductStockFifo(productId, qty, { transaction } = {}) {
     throw new Error("qty must be a positive integer");
   }
 
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  const todayStr = today.toISOString().slice(0, 10);
+
   const batches = await ProductBatch.findAll({
-    where: { productId, qty: { [Op.gt]: 0 } },
+    where: {
+      productId,
+      qty: { [Op.gt]: 0 },
+      [Op.or]: [
+        { expireDate: null },
+        { expireDate: { [Op.gte]: todayStr } },
+      ],
+    },
     order: [["expireDate", "ASC NULLS LAST"]],
     transaction,
   });
@@ -258,9 +269,24 @@ async function allocateBatchesToOrderDetail(orderDetailId, productId, qty, { use
     throw new Error("qty must be a positive integer");
   }
 
+  // Exclude already-expired batches from FEFO selection. A batch is
+  // expired when expireDate < today (midnight-stripped comparison,
+  // matching isExpired() semantics — batches expiring today are still
+  // sellable). Batches with no expiry date are always included.
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  const todayStr = today.toISOString().slice(0, 10);
+
   // Reuse existing FIFO/FEFO ordering to pick batches
   const batches = await ProductBatch.findAll({
-    where: { productId, qty: { [Op.gt]: 0 } },
+    where: {
+      productId,
+      qty: { [Op.gt]: 0 },
+      [Op.or]: [
+        { expireDate: null },
+        { expireDate: { [Op.gte]: todayStr } },
+      ],
+    },
     order: [["expireDate", "ASC NULLS LAST"], ["createdAt", "ASC"]],
     transaction,
   });
@@ -424,6 +450,89 @@ async function processReturn(orderDetailId, productId, qty, { userId = null, tra
   return movements;
 }
 
+// ─── NEW: Automated expiry processing ───────────────────────
+
+/**
+ * Find all ProductBatch rows that have passed their expire_date (strictly
+ * before today), still have qty > 0, and have not yet been processed by
+ * the expiry sweep (expired_movement_created = false).
+ *
+ * For each matching batch the function (inside its own transaction):
+ *   1. Sets ProductBatch.qty = 0 and expired_movement_created = true
+ *   2. Updates Inventory (delta = -originalQty)
+ *   3. Creates an EXPIRED StockMovement (quantity = -originalQty) for
+ *      loss auditing — the negative value records how much stock was lost
+ *   4. Re-syncs Product.qty and Product.expireDate
+ *
+ * Failures on individual batches are logged and skipped so one bad row
+ * does not block the rest of the sweep.
+ *
+ * @returns {Promise<{ processedCount: number, movementCount: number }>}
+ */
+async function processExpiredBatches() {
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  const todayStr = today.toISOString().slice(0, 10); // YYYY-MM-DD
+
+  const expiredBatches = await ProductBatch.findAll({
+    where: {
+      qty: { [Op.gt]: 0 },
+      expireDate: { [Op.lt]: todayStr },
+      expiredMovementCreated: false,
+    },
+  });
+
+  let processedCount = 0;
+  let movementCount = 0;
+
+  for (const batch of expiredBatches) {
+    const originalQty = Number(batch.qty);
+    const productId = batch.productId;
+    const batchId = batch.id;
+
+    const t = await sequelize.transaction();
+    try {
+      // 1. Zero out the batch and mark it as processed
+      await batch.update(
+        { qty: 0, expiredMovementCreated: true },
+        { transaction: t }
+      );
+
+      // 2. Update Inventory (deduct the expired quantity)
+      await updateInventoryForBatch(batchId, -originalQty, 0, { transaction: t });
+
+      // 3. Create EXPIRED StockMovement — negative qty for loss auditing
+      await createStockMovement(
+        productId,
+        batchId,
+        "EXPIRED",
+        -originalQty,
+        {
+          userId: null,
+          reason: "Automated expiry sweep",
+          transaction: t,
+        }
+      );
+
+      // 4. Re-sync Product.qty and Product.expireDate
+      await syncProductFromBatches(productId, { transaction: t });
+
+      await t.commit();
+      processedCount++;
+      movementCount++;
+
+      console.log(
+        `[ExpirySweep] Expired batch id=${batchId} productId=${productId} qty=${originalQty}`
+      );
+    } catch (err) {
+      await t.rollback();
+      console.error(`[ExpirySweep] Failed to process batch id=${batchId}:`, err.message);
+    }
+  }
+
+  return { processedCount, movementCount };
+}
+
 module.exports = {
   syncProductFromBatches,
   addStockToBatch,
@@ -437,4 +546,5 @@ module.exports = {
   updateInventoryForBatch,
   allocateBatchesToOrderDetail,
   processReturn,
+  processExpiredBatches,
 };
