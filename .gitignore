@@ -9,3 +9,5 @@ config/config.json
 # Runtime logs & backups
 *.log
 *.bak
+testExpirySweep.js
+testFefo.js
