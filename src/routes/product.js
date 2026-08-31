@@ -303,7 +303,11 @@ router.post("/:id/batches", authenticate, authorizeRoles("admin"), async (req, r
   const transaction = await sequelize.transaction();
   try {
     const { id } = req.params;
-    const { qty, expire_date, batch_number, cost_price } = req.body;
+    // Accept both snake_case (legacy) and camelCase (frontend) field names.
+    const { qty, expire_date, batch_number, cost_price, expireDate, batchNumber, costPrice } = req.body;
+    const _expireDate = expireDate ?? expire_date ?? null;
+    const _batchNumber = batchNumber ?? batch_number ?? null;
+    const _costPrice = costPrice ?? cost_price ?? null;
 
     const product = await Product.findByPk(id, { transaction });
     if (!product) {
@@ -326,9 +330,9 @@ router.post("/:id/batches", authenticate, authorizeRoles("admin"), async (req, r
       id,
       {
         qty: Number(qty),
-        expireDate: expire_date || null,
-        batchNumber: batch_number || null,
-        costPrice: cost_price,
+        expireDate: _expireDate,
+        batchNumber: _batchNumber,
+        costPrice: _costPrice,
       },
       { transaction }
     );
