@@ -55,12 +55,23 @@ router.get("/", async (req, res) => {
       ? { [Op.and]: conditions }
       : {};
 
+    // Sort by nearest batch expiry (soonest first, no-expiry last) when
+    // ?sort=expiry is requested. Otherwise default to createdAt DESC.
+    const sortExpiry = req.query.sort === "expiry";
+    const orderClause = sortExpiry
+      ? [
+          sequelize.literal(
+            '(SELECT MIN("expireDate") FROM "ProductBatches" WHERE "ProductBatches"."productId" = "Product"."id") ASC NULLS LAST'
+          ),
+        ]
+      : [["createdAt", "DESC"]];
+
     const { rows: products, count: total } = await Product.findAndCountAll({
       where: whereCondition,
       distinct: true,
       limit,
       offset,
-      order: [["createdAt", "DESC"]],
+      order: orderClause,
       include: [
         {
           model: Category,
@@ -913,7 +924,13 @@ router.patch("/:id/stock/out", authenticate, authorizeRoles("admin"), async (req
   const transaction = await sequelize.transaction();
   try {
     const { id } = req.params;
-    const { qty } = req.body;
+    const { qty, type, reason } = req.body;
+
+    // Accept ADJUSTMENT or DAMAGE; default to ADJUSTMENT for backward compat.
+    const movementType = ["ADJUSTMENT", "DAMAGE"].includes(type)
+      ? type
+      : "ADJUSTMENT";
+    const movementReason = reason || "Manual stock out";
 
     if (!qty || isNaN(qty) || Number(qty) <= 0) {
       await transaction.rollback();
@@ -973,12 +990,12 @@ router.patch("/:id/stock/out", authenticate, authorizeRoles("admin"), async (req
       await createStockMovement(
         id,
         batch.id,
-        "ADJUSTMENT",
+        movementType,
         -take,
         {
           userId: req.user ? req.user.id : null,
           referenceId: `stockOut:product:${id}`,
-          reason:      "Manual stock out",
+          reason:      movementReason,
           transaction,
         }
       );
