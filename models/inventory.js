@@ -17,6 +17,10 @@ module.exports = (sequelize, DataTypes) => {
 
   Inventory.init(
     {
+      productId: {
+        type:      DataTypes.INTEGER,
+        allowNull: false,
+      },
       batchId: {
         type:      DataTypes.INTEGER,
         allowNull: false,

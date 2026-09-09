@@ -349,8 +349,8 @@ router.post("/:id/batches", authenticate, authorizeRoles("admin"), async (req, r
     );
 
     // Create Inventory record and PURCHASE movement
-    await ensureInventoryForBatch(batch.id, { transaction });
-    await updateInventoryForBatch(batch.id, Number(qty), 0, { transaction });
+    await ensureInventoryForBatch(batch.id, id, { transaction });
+    await updateInventoryForBatch(batch.id, Number(qty), 0, id, { transaction });
     await createStockMovement(
       id,
       batch.id,
@@ -552,8 +552,8 @@ router.post("/", authenticate, authorizeRoles("admin"), async (req, res) => {
       );
 
       // Initialize Inventory and create PURCHASE movement
-      await ensureInventoryForBatch(batch.id, { transaction });
-      await updateInventoryForBatch(batch.id, Number(qty), 0, { transaction });
+      await ensureInventoryForBatch(batch.id, createdProduct.id, { transaction });
+      await updateInventoryForBatch(batch.id, Number(qty), 0, createdProduct.id, { transaction });
       await createStockMovement(
         createdProduct.id,
         batch.id,
@@ -754,8 +754,8 @@ router.put("/:id", authenticate, authorizeRoles("admin"), async (req, res) => {
 
       if (delta > 0) {
         const batch = await addStockToBatch(id, { qty: delta, expireDate: nextExpireDate }, { transaction });
-        await ensureInventoryForBatch(batch.id, { transaction });
-        await updateInventoryForBatch(batch.id, delta, 0, { transaction });
+        await ensureInventoryForBatch(batch.id, id, { transaction });
+        await updateInventoryForBatch(batch.id, delta, 0, id, { transaction });
         await createStockMovement(
           id, batch.id, "PURCHASE", delta,
           {
@@ -785,7 +785,7 @@ router.put("/:id", authenticate, authorizeRoles("admin"), async (req, res) => {
           if (remaining <= 0) break;
           const take = Math.min(Number(batch.qty), remaining);
           await batch.update({ qty: Number(batch.qty) - take }, { transaction });
-          await updateInventoryForBatch(batch.id, -take, 0, { transaction });
+          await updateInventoryForBatch(batch.id, -take, 0, id, { transaction });
           await createStockMovement(
             id, batch.id, "ADJUSTMENT", -take,
             {
@@ -879,8 +879,8 @@ router.patch("/:id/stock/in", authenticate, authorizeRoles("admin"), async (req,
     const batch = await addStockToBatch(id, { qty: Number(qty) }, { transaction });
 
     // Update Inventory and create PURCHASE movement
-    await ensureInventoryForBatch(batch.id, { transaction });
-    await updateInventoryForBatch(batch.id, Number(qty), 0, { transaction });
+    await ensureInventoryForBatch(batch.id, id, { transaction });
+    await updateInventoryForBatch(batch.id, Number(qty), 0, id, { transaction });
     await createStockMovement(
       id,
       batch.id,
@@ -927,8 +927,8 @@ router.patch("/:id/stock/out", authenticate, authorizeRoles("admin"), async (req
     const { qty, type, reason } = req.body;
 
     // Accept ADJUSTMENT or DAMAGE; default to ADJUSTMENT for backward compat.
-    const movementType = ["ADJUSTMENT", "DAMAGE"].includes(type)
-      ? type
+    const movementType = ["ADJUSTMENT", "DAMAGE"].includes(type?.toUpperCase())
+      ? type.toUpperCase()
       : "ADJUSTMENT";
     const movementReason = reason || "Manual stock out";
 
@@ -946,14 +946,6 @@ router.patch("/:id/stock/out", authenticate, authorizeRoles("admin"), async (req
       return res.status(404).json({
         success: false,
         message: `Product id=${id} not found`,
-      });
-    }
-
-    if (Number(qty) > product.qty) {
-      await transaction.rollback();
-      return res.status(400).json({
-        success: false,
-        message: `Insufficient stock. Available: ${product.qty}, Requested: ${qty}`,
       });
     }
 
@@ -981,12 +973,22 @@ router.patch("/:id/stock/out", authenticate, authorizeRoles("admin"), async (req
       transaction,
     });
 
+    // Check against sellable (non-expired) batches — same filter the deduction loop uses.
+    const availableQty = batches.reduce((sum, b) => sum + Number(b.qty), 0);
+    if (Number(qty) > availableQty) {
+      await transaction.rollback();
+      return res.status(400).json({
+        success: false,
+        message: `Insufficient stock. Available: ${availableQty}, Requested: ${qty}`,
+      });
+    }
+
     let remaining = outQty;
     for (const batch of batches) {
       if (remaining <= 0) break;
       const take = Math.min(Number(batch.qty), remaining);
       await batch.update({ qty: Number(batch.qty) - take }, { transaction });
-      await updateInventoryForBatch(batch.id, -take, 0, { transaction });
+      await updateInventoryForBatch(batch.id, -take, 0, id, { transaction });
       await createStockMovement(
         id,
         batch.id,

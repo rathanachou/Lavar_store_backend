@@ -88,6 +88,12 @@ async function addStockToBatch(productId, { qty, expireDate = null, batchNumber 
     { transaction }
   );
 
+  // Ensure an Inventory row exists for the new batch (defense in depth —
+  // call sites in product.js also do this, but this helper must be
+  // self-sufficient so any future caller can't forget).
+  await ensureInventoryForBatch(created.id, productId, { transaction });
+  await updateInventoryForBatch(created.id, q, 0, productId, { transaction });
+
   await syncProductFromBatches(productId, { transaction });
 
   return created;
@@ -155,8 +161,9 @@ async function restoreStockToBatch(productId, qty, { transaction } = {}) {
 
   if (target) {
     await target.update({ qty: Number(target.qty) + q }, { transaction });
+    await updateInventoryForBatch(target.id, q, 0, productId, { transaction });
   } else {
-    await ProductBatch.create(
+    const created = await ProductBatch.create(
       {
         productId,
         qty: q,
@@ -166,6 +173,8 @@ async function restoreStockToBatch(productId, qty, { transaction } = {}) {
       },
       { transaction }
     );
+    await ensureInventoryForBatch(created.id, productId, { transaction });
+    await updateInventoryForBatch(created.id, q, 0, productId, { transaction });
   }
 
   await syncProductFromBatches(productId, { transaction });
@@ -209,10 +218,12 @@ async function createStockMovement(productId, batchId, type, quantity, { userId 
  * Ensure an Inventory row exists for a given batch. If it already exists,
  * return the existing row. Must be called after a ProductBatch is created.
  */
-async function ensureInventoryForBatch(batchId, { transaction } = {}) {
+async function ensureInventoryForBatch(batchId, productId, { transaction } = {}) {
   let inv = await Inventory.findOne({ where: { batchId }, transaction });
   if (!inv) {
-    inv = await Inventory.create({ batchId, qty: 0, availableQty: 0, reservedQty: 0 }, { transaction });
+    const row = { batchId, qty: 0, availableQty: 0, reservedQty: 0 };
+    if (productId !== undefined && productId !== null) row.productId = productId;
+    inv = await Inventory.create(row, { transaction });
   }
   return inv;
 }
@@ -227,8 +238,8 @@ async function ensureInventoryForBatch(batchId, { transaction } = {}) {
  * @param {object} [opts]
  * @param {object} [opts.transaction]
  */
-async function updateInventoryForBatch(batchId, deltaQty, deltaReserved = 0, { transaction } = {}) {
-  const inv = await ensureInventoryForBatch(batchId, { transaction });
+async function updateInventoryForBatch(batchId, deltaQty, deltaReserved = 0, productId = null, { transaction } = {}) {
+  const inv = await ensureInventoryForBatch(batchId, productId, { transaction });
 
   const newQty         = Number(inv.qty)         + Number(deltaQty);
   const newReserved    = Number(inv.reservedQty)  + Number(deltaReserved);
@@ -306,7 +317,7 @@ async function allocateBatchesToOrderDetail(orderDetailId, productId, qty, { use
     await batch.update({ qty: Number(batch.qty) - take }, { transaction });
 
     // 2. Update Inventory
-    await updateInventoryForBatch(batch.id, -take, 0, { transaction });
+    await updateInventoryForBatch(batch.id, -take, 0, productId, { transaction });
 
     // 3. Create OrderDetailBatch record
     const odb = await OrderDetailBatch.create(
@@ -387,7 +398,7 @@ async function processReturn(orderDetailId, productId, qty, { userId = null, tra
 
       const add = Math.min(remaining, alloc.quantity); // cap at original allocation
       await batch.update({ qty: Number(batch.qty) + add }, { transaction });
-      await updateInventoryForBatch(batch.id, add, 0, { transaction });
+      await updateInventoryForBatch(batch.id, add, 0, productId, { transaction });
 
       const mv = await createStockMovement(
         productId,
@@ -414,10 +425,10 @@ async function processReturn(orderDetailId, productId, qty, { userId = null, tra
 
     if (target) {
       await target.update({ qty: Number(target.qty) + returnQty }, { transaction });
-      await updateInventoryForBatch(target.id, returnQty, 0, { transaction });
+      await updateInventoryForBatch(target.id, returnQty, 0, productId, { transaction });
     } else {
-      // No batch at all — create a new one
-      await ProductBatch.create(
+      // No batch at all — create a new one with Inventory row
+      const created = await ProductBatch.create(
         {
           productId,
           qty:         returnQty,
@@ -427,6 +438,8 @@ async function processReturn(orderDetailId, productId, qty, { userId = null, tra
         },
         { transaction }
       );
+      await ensureInventoryForBatch(created.id, productId, { transaction });
+      await updateInventoryForBatch(created.id, returnQty, 0, productId, { transaction });
     }
 
     const mv = await createStockMovement(
@@ -499,7 +512,7 @@ async function processExpiredBatches() {
       );
 
       // 2. Update Inventory (deduct the expired quantity)
-      await updateInventoryForBatch(batchId, -originalQty, 0, { transaction: t });
+      await updateInventoryForBatch(batchId, -originalQty, 0, productId, { transaction: t });
 
       // 3. Create EXPIRED StockMovement — negative qty for loss auditing
       await createStockMovement(
