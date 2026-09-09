@@ -174,19 +174,23 @@ router.post("/:id/confirm", async (req, res) => {
         return res.status(404).json({ success: false, message: `Product id=${detail.productId} not found` });
       }
 
-      //  Block expired products at confirm time too (defense in depth: stock was
-      //  checked but not deducted at order creation, so batches may have changed).
-      if (await isExpired(detail.productId, { transaction })) {
-        await transaction.rollback();
-        return res.status(400).json({
-          success: false,
-          message: `Product "${product.name}" is expired and cannot be sold`,
-        });
-      }
-
-      // Allocate batches (FIFO), create OrderDetailBatches, reduce stock,
-      // update Inventory, and create SALE movements — atomically.
+      // All expiry checks, batch allocation, and stock deduction run inside
+      // the inner try/catch so any failure — including DB errors from
+      // isExpired or ensureInventoryForBatch — maps to a clean 400/500
+      // instead of crashing through to the outer catch as a raw 500.
       try {
+        //  Block expired products at confirm time too (defense in depth: stock was
+        //  checked but not deducted at order creation, so batches may have changed).
+        if (await isExpired(detail.productId, { transaction })) {
+          await transaction.rollback();
+          return res.status(400).json({
+            success: false,
+            message: `Product "${product.name}" is expired and cannot be sold`,
+          });
+        }
+
+        // Allocate batches (FIFO), create OrderDetailBatches, reduce stock,
+        // update Inventory, and create SALE movements — atomically.
         await allocateBatchesToOrderDetail(detail.id, detail.productId, detail.qty, {
           userId: req.user ? req.user.id : null,
           transaction,
@@ -194,12 +198,15 @@ router.post("/:id/confirm", async (req, res) => {
       } catch (err) {
         await transaction.rollback();
         const message = err.message || "Failed to allocate stock for this order";
-        // Map known allocation errors to clear 400 responses so the
+        // Map known allocation / stock errors to clear 400 responses so the
         // frontend can show the cashier a meaningful message.
         if (
           message.includes("No batches available") ||
           message.includes("Insufficient stock") ||
-          message.includes("Stock")
+          message.includes("Stock") ||
+          message.includes("expired") ||
+          message.includes("constraint") ||
+          message.includes("not-null")
         ) {
           return res.status(400).json({ success: false, message });
         }

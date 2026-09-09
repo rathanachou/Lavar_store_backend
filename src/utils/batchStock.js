@@ -306,6 +306,15 @@ async function allocateBatchesToOrderDetail(orderDetailId, productId, qty, { use
     throw new Error(`No batches available for product id=${productId}`);
   }
 
+  const totalAvailable = batches.reduce((sum, b) => sum + Number(b.qty), 0);
+  if (totalAvailable < remaining) {
+    throw new Error(
+      `Insufficient stock for product id=${productId}. ` +
+        `Available: ${totalAvailable}, Requested: ${remaining}. ` +
+        `(Product.qty may include expired batches)`
+    );
+  }
+
   const allocations = [];
   let toDeduct = remaining;
 
